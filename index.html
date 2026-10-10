@@ -1,0 +1,406 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Checklist</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,600;0,700;1,600&family=Jost:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#0d0a0f;--card:#171219;--line:#2c2231;--ink:#eadfe0;--muted:#9a8f9c;--gold:#b08d57;--wine:#2a0f1c;--hf:"Cormorant Garamond",Georgia,serif;--bf:"Jost",system-ui,sans-serif}
+*{box-sizing:border-box}
+body{margin:0;background:radial-gradient(900px 420px at 50% -120px,#2b0f1e 0%,transparent 70%),var(--bg);color:var(--ink);font-family:var(--bf);min-height:100vh}
+.top{max-width:1300px;margin:0 auto;padding:30px 16px 8px}
+.head{display:flex;flex-wrap:wrap;gap:16px;align-items:flex-end;justify-content:space-between}
+h1{font-family:var(--hf);font-style:italic;font-weight:600;font-size:clamp(2.6rem,7vw,4.4rem);line-height:1;margin:6px 0 8px;color:#f3e6dc;letter-spacing:.01em}
+.sub{margin:0;color:var(--muted);max-width:60ch;font-size:.98rem}
+.nm{font:italic 600 1.35rem var(--hf);background:transparent;border:0;border-bottom:1px solid var(--gold);color:var(--gold);padding:2px 0;width:min(320px,100%)}
+.nm::placeholder{color:#7b6847}
+input:focus,button:focus-visible{outline:2px solid var(--gold);outline-offset:3px}
+.acts{display:flex;gap:8px;flex-wrap:wrap}
+.btn{font:500 .95rem var(--bf);letter-spacing:.03em;border:1px solid var(--gold);background:transparent;color:#f3e6dc;border-radius:4px;padding:10px 16px;cursor:pointer;transition:background .2s,color .2s}
+.btn:hover{background:rgba(176,141,87,.16)}
+.btn.p{background:var(--gold);color:#1a1210;font-weight:600}
+.btn.p:hover{background:#c4a06a}
+.btn.sm{padding:6px 12px;font-size:.85rem}
+.legend{display:flex;flex-wrap:wrap;gap:8px 20px;margin:22px 0 6px;font-size:.92rem;color:var(--ink)}
+.legend span{display:inline-flex;align-items:center;gap:8px}
+.legend i{display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;border-radius:50%;font:600 12px var(--bf);font-style:normal;color:var(--t)}
+.cols{max-width:1300px;margin:0 auto;padding:10px 16px 50px;columns:3 340px;column-gap:20px}
+.card{break-inside:avoid;background:var(--card);border:1px solid var(--line);border-radius:4px;margin:0 0 20px;padding:0 0 12px;overflow:hidden;box-shadow:0 14px 30px -18px #000}
+.card h2{margin:0 0 10px;padding:14px 18px 12px;background:var(--wine);border-bottom:2px solid var(--gold);font:700 2.05rem/1.1 var(--hf);color:#f3e6dc;letter-spacing:.01em}
+.it{padding:9px 12px 9px 18px;margin:0 6px;border-radius:3px}
+.it+.it{border-top:1px solid var(--line)}
+.it .n{display:block;font-weight:600;font-size:1.05rem;padding:2px 0 5px}
+.inf{display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;margin-left:8px;border-radius:50%;border:1px solid var(--gold);background:transparent;color:var(--gold);font:italic 600 13px var(--hf);cursor:pointer;padding:0;vertical-align:middle}
+.inf:hover,.inf[aria-expanded=true]{background:rgba(176,141,87,.22)}
+.info{margin:2px 0 8px;padding:8px 10px;border-left:2px solid var(--gold);background:#1f1824;color:var(--ink);font-size:.92rem;line-height:1.4;white-space:pre-wrap}
+.info[hidden]{display:none}
+.pair{display:flex;flex-wrap:wrap;gap:8px 18px}
+.gl{display:block;font-size:.85rem;color:var(--muted);margin:0 0 4px}
+.dots{display:flex;gap:6px;align-items:center}
+.dots button{display:inline-flex;align-items:center;justify-content:center;width:30px;height:30px;border-radius:50%;font:600 13px var(--bf);background:color-mix(in srgb,var(--c) 14%,#1f1824);border:2px solid color-mix(in srgb,var(--c) 75%,transparent);color:var(--c);cursor:pointer;padding:0;touch-action:manipulation;transition:transform .15s,background .15s,box-shadow .15s}
+.dots button:hover{background:color-mix(in srgb,var(--c) 32%,#1f1824);transform:scale(1.1)}
+.dots button.on{background:var(--c);border-color:#fff;color:var(--t);transform:scale(1.2);box-shadow:0 0 0 4px color-mix(in srgb,var(--c) 35%,transparent),0 0 18px color-mix(in srgb,var(--c) 55%,transparent)}
+.dots button.pop{animation:pick .5s cubic-bezier(.3,1.5,.5,1)}
+@keyframes pick{0%{transform:scale(.7);box-shadow:0 0 0 0 color-mix(in srgb,var(--c) 60%,transparent)}55%{transform:scale(1.55);box-shadow:0 0 0 16px color-mix(in srgb,var(--c) 0%,transparent)}100%{transform:scale(1.2);box-shadow:0 0 0 4px color-mix(in srgb,var(--c) 35%,transparent),0 0 18px color-mix(in srgb,var(--c) 55%,transparent)}}
+.it.flash{animation:flash .8s ease-out}
+@keyframes flash{0%{background:color-mix(in srgb,var(--rc) 50%,var(--card))}100%{background:color-mix(in srgb,var(--rc) 16%,var(--card))}}
+.tools{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px;margin:20px 0 0}
+.tg{min-width:0;border:1px solid var(--line);background:rgba(23,18,25,.75);border-radius:4px;padding:12px 14px 14px}
+.tg h4{margin:0 0 10px;font:600 .72rem var(--bf);letter-spacing:.16em;text-transform:uppercase;color:var(--gold)}
+.tg .brow{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.tg .btn{width:100%;padding:10px 8px;font-size:.88rem;line-height:1.2;text-align:center}
+.tg .btn.wide{grid-column:1/-1}
+.modal{position:fixed;inset:0;z-index:50;background:rgba(5,3,7,.8);display:flex;justify-content:center;align-items:flex-start;padding:16px 14px 24px;overflow:auto}
+.modal[hidden]{display:none}
+.mbox{position:relative;width:min(580px,100%);margin:auto 0;background:var(--card);border:1px solid var(--line);border-top:2px solid var(--gold);border-radius:4px;padding:22px 20px 20px;box-shadow:0 30px 60px -20px #000}
+.mbox h3{margin:0 40px 6px 0;font:700 2rem/1.1 var(--hf);color:#f3e6dc}
+.mx{position:absolute;top:10px;right:10px;width:34px;height:34px;border-radius:4px;border:1px solid var(--line);background:#1f1824;color:var(--ink);cursor:pointer;font:500 15px var(--bf);padding:0}
+.mx:hover{border-color:var(--gold)}
+.mp{margin:0 0 12px;color:var(--muted);font-size:.92rem;line-height:1.45}
+.cd{display:block;word-break:break-all;background:#1f1824;border:1px solid var(--line);border-radius:3px;padding:12px;font:500 1.05rem/1.5 ui-monospace,Menlo,Consolas,monospace;color:var(--gold);letter-spacing:.05em;margin:0 0 12px}
+.ta{display:block;width:100%;min-height:84px;background:#1f1824;border:1px solid var(--line);color:var(--ink);border-radius:3px;padding:10px;font:500 .95rem ui-monospace,Menlo,Consolas,monospace;margin:0 0 10px;resize:vertical}
+.brow{display:flex;gap:8px;flex-wrap:wrap}
+.big{font:italic 600 4.4rem/1 var(--hf);color:var(--gold);margin:14px 0 2px}
+.verdict{font:600 1.2rem var(--hf);color:#f3e6dc;margin:0 0 4px}
+.bar{height:8px;background:#1f1824;border-radius:4px;overflow:hidden}
+.bar i{display:block;height:100%;background:var(--gold)}
+.pc{margin:10px 0}
+.pc div:first-child{display:flex;justify-content:space-between;font-size:.95rem;margin-bottom:4px}
+.mh{font:700 1.35rem var(--hf);color:#f3e6dc;margin:20px 0 8px}
+.chips{display:flex;flex-wrap:wrap;gap:6px}
+.chip{padding:4px 10px;border-radius:99px;border:1px solid var(--line);background:#1f1824;font-size:.88rem}
+.chip.g{border-color:rgba(53,224,138,.45);color:#bff5d8}
+.chip.t{border-color:rgba(224,128,95,.6)}
+.chip small{color:var(--muted);margin-left:4px}
+.err{color:#e0805f;margin:0 0 10px;font-size:.92rem}
+.cmpnote{margin:14px 0 0;padding:10px 14px;border:1px solid var(--gold);border-radius:4px;color:var(--gold);font-size:.95rem;display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+.cmpnote[hidden]{display:none}
+.foot{text-align:center;color:#6f6473;font-size:.85rem;padding:0 16px 40px}
+
+/* ---- owner edit mode ---- */
+body.edit .viewonly{display:none}
+.editnote{max-width:1300px;margin:14px auto 0;padding:10px 14px;border:1px dashed var(--gold);border-radius:4px;color:var(--gold);font-size:.92rem}
+.ti,.si{display:block;width:100%;background:transparent;border:0;border-bottom:1px dashed var(--gold);color:inherit;font:inherit;padding:0 0 2px}
+.ti{max-width:14em}
+.si{max-width:60ch;font-size:.98rem}
+.ch{display:flex;gap:8px;align-items:center;background:var(--wine);border-bottom:2px solid var(--gold);padding:12px 12px 10px;margin:0 0 10px}
+.ci{flex:1;min-width:0;font:700 1.6rem var(--hf);background:transparent;border:0;border-bottom:1px dashed var(--gold);color:#f3e6dc;padding:0 0 2px}
+.mv{display:flex;gap:4px}
+.mv button,.x{width:32px;height:32px;border-radius:4px;border:1px solid var(--line);background:#1f1824;color:var(--ink);cursor:pointer;font:500 15px var(--bf);padding:0}
+.mv button:hover,.x:hover{border-color:var(--gold)}
+.it.ed{display:block;padding:6px 12px 6px 18px;border-top:0}
+.edrow{display:flex;align-items:center;gap:8px}
+.ie{display:block;width:100%;margin:4px 0 0;font:400 .9rem var(--bf);background:#1f1824;border:1px solid var(--line);color:var(--muted);padding:6px 8px;border-radius:3px;resize:vertical;min-height:34px}
+.ii,.li{flex:1;min-width:0;font:500 1rem var(--bf);background:#1f1824;border:1px solid var(--line);color:var(--ink);padding:8px;border-radius:3px}
+.one{display:flex;align-items:center;gap:6px;font-size:.85rem;color:var(--muted);margin:8px 0 0;cursor:pointer}
+.lrow{padding:0 18px 10px}
+.addrow{padding:6px 18px 0}
+.addcat{break-inside:avoid;margin:0 0 20px}
+
+@media(max-width:560px){.pair{flex-direction:column;gap:10px}.g{width:100%}.dots{width:100%;justify-content:space-between;gap:6px}.dots button{flex:1;max-width:60px;width:auto;height:44px;border-radius:12px;font-size:16px}.dots button.on{transform:scale(1.06)}.it.ed{padding:4px 12px 4px 18px}}
+@media(prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
+</style>
+</head>
+<body>
+<header class="top">
+  <div class="head">
+    <div>
+      <input class="nm viewonly" id="nm" placeholder="Your name (optional)" maxlength="30" aria-label="Your name">
+      <h1 id="ttl"></h1>
+      <p class="sub" id="sub"></p>
+    </div>
+    <div class="acts">
+      <button class="btn own" id="edt">Edit categories</button>
+      <button class="btn own" id="rst" hidden>Discard my edits</button>
+      <button class="btn p own" id="lck">Lock &amp; download</button>
+    </div>
+  </div>
+  <div class="editnote own" id="enote" hidden>Edit mode: change the title, categories and items below. Your edits are saved in this browser as you type. When you're happy, press "Lock &amp; download" to get the file to publish.</div>
+  <div class="tools viewonly">
+    <section class="tg"><h4>Compare with a partner</h4><div class="brow"><button class="btn p" id="gcd">Get my code</button><button class="btn" id="cmp">Compare</button></div></section>
+    <section class="tg"><h4>Your ratings</h4><div class="brow"><button class="btn p wide" id="sbm">Submit my ratings</button><button class="btn" id="dl">Download image</button><button class="btn" id="dlr">Download rated only</button><button class="btn wide" id="clr">Clear my ratings</button></div></section>
+  </div>
+  <div class="legend viewonly" id="legend"></div>
+  <div class="cmpnote viewonly" id="cnote" hidden><span>Someone shared their results with you. Rate the items you want, then compare.</span><button class="btn sm" id="cnow">Compare now</button></div>
+</header>
+<main class="cols" id="cols"></main>
+<p class="foot viewonly">Your ratings stay on your device. Nothing is uploaded. A code or link contains your answers, so only send it to someone you trust.</p>
+<div class="modal" id="mdl" hidden role="dialog" aria-modal="true"><div class="mbox"><button class="mx" id="mcl" aria-label="Close">✕</button><div id="mbody"></div></div></div>
+
+<script>
+/* ===== OWNER SETTINGS: managed by the editor. The locked copy you publish has LOCKED=true and no edit tools. ===== */
+const LOCKED=false;
+const BASE={
+  title:"My Kinklist",
+  subtitle:"Rate each one from 1 (hated) to 5 (very enjoyed). 3 means no opinion.",
+  labels:["Self","Partner"],
+  categories:[
+    {name:"Food",items:["Pizza","Sushi","Tacos","Pasta","Ice cream"]},
+    {name:"Games",items:["Minecraft","Roblox","Puzzle games","Racing games","Party games"]},
+    {name:"Hobbies",items:["Drawing","Reading","Baking","Swimming","Hiking"]},
+    {name:"Music",items:["Pop","Hip-hop","K-pop","Rock","Lo-fi"]},
+    {name:"School",items:["Math","Science","History","Art","PE"]},
+    {name:"Activities",items:["Movie night","Road trip","Board games","Beach day","Shopping"]}
+  ]
+};
+/* ===== end of owner settings ===== */
+
+const RATES=[["Hated","#c2415a","#fff"],["Dislike","#e0805f","#1a1210"],["Neutral","#8e8a9c","#fff"],["Like","#6fbf8b","#0f1a14"],["Very enjoyed","#35e08a","#0f1a14"]];
+const KEY="ratelist-locked-v2",DKEY="ratelist-draft-v1";
+const $=id=>document.getElementById(id);
+const esc=t=>String(t).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const key=(c,n,w)=>c+"|"+n+"|"+w;
+
+/* the config in use: owner draft while editing, otherwise the baked-in one */
+let CONFIG=BASE,EDIT=false;
+if(!LOCKED){try{const d=JSON.parse(localStorage.getItem(DKEY));if(d&&Array.isArray(d.categories))CONFIG=d}catch(e){}}
+CONFIG={...CONFIG,title:BASE.title};
+if(!Array.isArray(CONFIG.labels)||CONFIG.labels.length!==2)CONFIG={...CONFIG,labels:["Self","Partner"]};
+const saveDraft=()=>{if(LOCKED)return;try{localStorage.setItem(DKEY,JSON.stringify(CONFIG))}catch(e){}};
+
+/* visitor ratings */
+let S;try{S=JSON.parse(localStorage.getItem(KEY))||{}}catch(e){S={}}
+S.name=S.name||"";S.r=S.r||{};
+const save=()=>{try{localStorage.setItem(KEY,JSON.stringify(S))}catch(e){}};
+const get=(c,n,w)=>S.r[key(c,n,w)]||0;
+const OPEN=new Set();
+const lbl=c=>(c.labels&&c.labels.length===2)?c.labels:CONFIG.labels;
+const rows=c=>c.single?[lbl(c)[0]]:lbl(c);
+const infOf=(c,ii)=>((c.info&&c.info[ii])||"").trim();
+
+if(LOCKED)document.querySelectorAll(".own").forEach(e=>e.remove());
+
+function renderHead(){
+  document.title=CONFIG.title;
+  if(EDIT){
+    $("ttl").innerHTML=`<input class="ti" id="tin" value="${esc(CONFIG.title)}" maxlength="40" aria-label="Page title">`;
+    $("sub").innerHTML=`<input class="si" id="sin" value="${esc(CONFIG.subtitle)}" maxlength="160" aria-label="Subtitle">`;
+  }else{$("ttl").textContent=CONFIG.title;$("sub").textContent=CONFIG.subtitle}
+}
+$("legend").innerHTML=RATES.map(([l,c,t],k)=>`<span><i style="background:${c};--t:${t}">${k+1}</i>${l}</span>`).join("");
+
+function renderView(){
+  $("cols").innerHTML=CONFIG.categories.map((c,ci)=>`<section class="card"><h2>${esc(c.name)}</h2>${c.items.map((n,ii)=>`<div class="it"><span class="n">${esc(n)}${infOf(c,ii)?`<button class="inf" data-c="${ci}" data-i="${ii}" aria-expanded="${OPEN.has(key(c.name,n,"i"))}" aria-label="What is ${esc(n)}?" title="What is this?">i</button>`:""}</span>${infOf(c,ii)?`<div class="info"${OPEN.has(key(c.name,n,"i"))?"":" hidden"}>${esc(infOf(c,ii))}</div>`:""}<div class="pair">${rows(c).map((lb,w)=>{const r=get(c.name,n,w);return `<div class="g"><span class="gl">${esc(lb)}</span><div class="dots">${RATES.map(([l,col,t],ri)=>`<button class="${r===ri+1?"on":""}" style="--c:${col};--t:${t}" data-c="${ci}" data-i="${ii}" data-w="${w}" data-r="${ri+1}" aria-label="${esc(n)}, ${esc(lb)}: ${ri+1} ${l}" aria-pressed="${r===ri+1}" title="${ri+1}: ${l}">${ri+1}</button>`).join("")}</div></div>`}).join("")}</div></div>`).join("")}</section>`).join("");
+}
+function renderEdit(){
+  $("cols").innerHTML=CONFIG.categories.map((c,ci)=>`<section class="card"><div class="ch"><input class="ci" data-k="cat" data-c="${ci}" value="${esc(c.name)}" maxlength="30" aria-label="Category name"><div class="mv"><button data-a="up" data-c="${ci}" title="Move up" aria-label="Move category up">↑</button><button data-a="dn" data-c="${ci}" title="Move down" aria-label="Move category down">↓</button><button data-a="rmc" data-c="${ci}" title="Delete category" aria-label="Delete category">✕</button></div></div><div class="lrow"><span class="gl">${c.single?"Name of the rating row":"Names of the two rating rows"}</span><div class="pair">${lbl(c).slice(0,c.single?1:2).map((l,w)=>`<input class="li" data-k="clbl" data-c="${ci}" data-w="${w}" value="${esc(l)}" maxlength="20" aria-label="Rating row name ${w+1}">`).join("")}</div><label class="one"><input type="checkbox" data-k="single" data-c="${ci}"${c.single?" checked":""}> Only one rating row</label></div>${c.items.map((n,ii)=>`<div class="it ed"><div class="edrow"><input class="ii" data-k="item" data-c="${ci}" data-i="${ii}" value="${esc(n)}" maxlength="40" aria-label="Item name"><button class="x" data-a="rmi" data-c="${ci}" data-i="${ii}" title="Delete item" aria-label="Delete item">✕</button></div><textarea class="ie" data-k="info" data-c="${ci}" data-i="${ii}" rows="2" maxlength="400" placeholder="Info box (optional): explain this for anyone who doesn't know what it means" aria-label="Info text">${esc((c.info&&c.info[ii])||"")}</textarea></div>`).join("")}<div class="addrow"><button class="btn sm" data-a="addi" data-c="${ci}">+ Add item</button></div></section>`).join("")+`<div class="addcat"><button class="btn" data-a="addc">+ Add category</button></div>`;
+}
+const render=()=>EDIT?renderEdit():renderView();
+
+$("cols").addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;
+  if(b.classList.contains("inf")){const c=CONFIG.categories[+b.dataset.c],k=key(c.name,c.items[+b.dataset.i],"i"),p=b.closest(".it").querySelector(".info"),show=p.hidden;p.hidden=!show;b.setAttribute("aria-expanded",show);show?OPEN.add(k):OPEN.delete(k);return}
+  if(EDIT){
+    const a=b.dataset.a,ci=+b.dataset.c,ii=+b.dataset.i,cs=CONFIG.categories;
+    if(a==="addc"){cs.push({name:"New category",items:[""],info:[""],labels:[...lbl(cs[0]||{})]});saveDraft();renderEdit();const f=$("cols").querySelectorAll(".ci");f[f.length-1].focus();f[f.length-1].select();return}
+    if(a==="addi"){cs[ci].items.push("");saveDraft();renderEdit();const f=$("cols").querySelectorAll(".card")[ci].querySelectorAll(".ii");f[f.length-1].focus();return}
+    if(a==="rmi"){cs[ci].items.splice(ii,1);if(cs[ci].info)cs[ci].info.splice(ii,1)}
+    else if(a==="rmc"){if(!confirm("Delete the category \""+cs[ci].name+"\" and all its items?"))return;cs.splice(ci,1)}
+    else if(a==="up"&&ci>0){[cs[ci-1],cs[ci]]=[cs[ci],cs[ci-1]]}
+    else if(a==="dn"&&ci<cs.length-1){[cs[ci+1],cs[ci]]=[cs[ci],cs[ci+1]]}
+    else return;
+    saveDraft();renderEdit();return;
+  }
+  const ci=+b.dataset.c,ii=+b.dataset.i,w=+b.dataset.w,v=+b.dataset.r,c=CONFIG.categories[ci],k=key(c.name,c.items[ii],w);
+  if(S.r[k]===v)delete S.r[k];else S.r[k]=v;
+  save();renderView();
+  if(S.r[k]){const on=document.querySelectorAll(".card")[ci].querySelectorAll(".it")[ii].querySelectorAll(".g")[w].querySelector(".on");on.classList.add("pop");on.focus({preventScroll:true})}
+});
+$("cols").addEventListener("input",e=>{if(!EDIT)return;const t=e.target,ci=+t.dataset.c;
+  if(t.dataset.k==="single"){CONFIG.categories[ci].single=t.checked;saveDraft();renderEdit();return}
+  if(t.dataset.k==="clbl"){const c=CONFIG.categories[ci];if(!c.labels||c.labels.length!==2)c.labels=[...CONFIG.labels];c.labels[+t.dataset.w]=t.value;saveDraft();return}
+  if(t.dataset.k==="cat")CONFIG.categories[ci].name=t.value;
+  else if(t.dataset.k==="item")CONFIG.categories[ci].items[+t.dataset.i]=t.value;
+  else if(t.dataset.k==="info"){const c=CONFIG.categories[ci];c.info=c.info||[];c.info[+t.dataset.i]=t.value}
+  else return;
+  saveDraft();
+});
+$("cols").addEventListener("keydown",e=>{
+  if(!EDIT||e.key!=="Enter"||e.target.dataset.k!=="item")return;
+  e.preventDefault();const ci=+e.target.dataset.c,ii=+e.target.dataset.i;
+  CONFIG.categories[ci].items.splice(ii+1,0,"");if(CONFIG.categories[ci].info)CONFIG.categories[ci].info.splice(ii+1,0,"");saveDraft();renderEdit();
+  $("cols").querySelectorAll(".card")[ci].querySelectorAll(".ii")[ii+1].focus();
+});
+$("ttl").addEventListener("input",e=>{if(EDIT&&e.target.id==="tin"){CONFIG.title=e.target.value;document.title=CONFIG.title;saveDraft()}});
+$("sub").addEventListener("input",e=>{if(EDIT&&e.target.id==="sin"){CONFIG.subtitle=e.target.value;saveDraft()}});
+
+$("nm").value=S.name;$("nm").oninput=e=>{S.name=e.target.value;save()};
+$("clr").onclick=()=>{if(confirm("Clear all your ratings?")){S.r={};save();render()}};
+
+/* remove blank items/categories, trim names */
+function tidy(){
+  CONFIG.title=CONFIG.title.trim()||"My Kinklist";
+  CONFIG.subtitle=CONFIG.subtitle.trim();
+  CONFIG.labels=CONFIG.labels.map((l,i)=>l.trim()||["Self","Partner"][i]);
+  CONFIG.categories=CONFIG.categories.map(c=>{const inf=c.info||[],pr=c.items.map((i,k)=>[i.trim(),(inf[k]||"").trim()]).filter(q=>q[0]);return{name:c.name.trim(),single:!!c.single,labels:[0,1].map(w=>((c.labels&&c.labels[w])||"").trim()||CONFIG.labels[w]),items:pr.map(q=>q[0]),info:pr.map(q=>q[1])}}).filter(c=>c.name&&c.items.length);
+  saveDraft();
+}
+function setEdit(on){
+  EDIT=on;document.body.classList.toggle("edit",on);
+  $("edt").textContent=on?"Done editing":"Edit categories";
+  $("rst").hidden=!on;$("enote").hidden=!on;
+  if(!on)tidy();
+  renderHead();render();
+}
+if(!LOCKED&&$("edt")){
+  $("edt").onclick=()=>setEdit(!EDIT);
+  $("rst").onclick=()=>{if(confirm("Throw away your edits and go back to the version saved in this file?")){try{localStorage.removeItem(DKEY)}catch(e){}CONFIG=JSON.parse(JSON.stringify(BASE));renderHead();render()}};
+  $("lck").onclick=()=>{
+    tidy();
+    if(!CONFIG.categories.length){alert("Add at least one category with one item first.");return}
+    for(const c of CONFIG.categories){const seen=new Set();for(const i of c.items){if(seen.has(i)){alert("\""+c.name+"\" has \""+i+"\" twice. Rename or delete one before locking.");return}seen.add(i)}}
+    if(!confirm("Lock this checklist and download it? The downloaded copy can't be edited by visitors. Keep this editable file for future changes."))return;
+    if(EDIT)setEdit(false);else{renderHead();render()}
+    const clone=document.documentElement.cloneNode(true);
+    clone.querySelector("body").classList.remove("edit");
+    ["cols","legend","ttl","sub"].forEach(id=>clone.querySelector("#"+id).innerHTML="");
+    clone.querySelectorAll(".own").forEach(e=>e.remove());
+    clone.querySelector("#nm").removeAttribute("value");
+    clone.querySelector("title").textContent=CONFIG.title;
+    const sc=clone.querySelector("script");
+    const json=JSON.stringify(CONFIG,null,2).replace(/</g,"\\u003c");
+    sc.textContent=sc.textContent.replace(/(\/\* ===== OWNER SETTINGS[\s\S]*?=====\s*\*\/)[\s\S]*?(\/\* ===== end of owner settings)/,(m,a,b)=>a+"\nconst LOCKED=true;\nconst BASE="+json+";\n"+b);
+    const html="<!doctype html>\n"+clone.outerHTML;
+    const blob=new Blob([html],{type:"text/html"}),a=document.createElement("a");
+    a.href=URL.createObjectURL(blob);a.download="checklist-locked.html";a.click();
+    setTimeout(()=>URL.revokeObjectURL(a.href),2000);
+  };
+}
+
+function rr(x,a,b,w,h,r){x.beginPath();x.moveTo(a+r,b);x.arcTo(a+w,b,a+w,b+h,r);x.arcTo(a+w,b+h,a,b+h,r);x.arcTo(a,b+h,a,b,r);x.arcTo(a,b,a+w,b,r);x.closePath()}
+function fit(x,t,max){if(x.measureText(t).width<=max)return t;while(t.length>1&&x.measureText(t+"…").width>max)t=t.slice(0,-1);return t+"…"}
+async function exportPNG(only){
+  try{await document.fonts.ready}catch(e){}
+  const HF='"Cormorant Garamond",Georgia,serif',BF='"Jost",system-ui,sans-serif',IVORY="#f3e6dc",CARD="#171219",GOLD="#b08d57";
+  const cols=3,W=1500,pad=44,gap=22,cw=(W-pad*2-gap*(cols-1))/cols,RH=96,TH=76;
+  const cards=CONFIG.categories.map(c=>({c,items:c.items.filter(n=>!only||get(c.name,n,0)||(!c.single&&get(c.name,n,1)))})).filter(o=>o.items.length);
+  const colH=Array(cols).fill(0),place=[];
+  cards.forEach(o=>{const h=TH+o.items.length*RH+16;let k=colH.indexOf(Math.min(...colH));place.push({o,k,y:colH[k],h});colH[k]+=h+gap});
+  const top=200,H=top+Math.max(...colH,0)+pad-gap+10,sc=2;
+  const cv=document.createElement("canvas");cv.width=W*sc;cv.height=H*sc;const x=cv.getContext("2d");x.scale(sc,sc);
+  const g=x.createRadialGradient(W/2,-60,0,W/2,-60,900);g.addColorStop(0,"#2b0f1e");g.addColorStop(1,"#0d0a0f");
+  x.fillStyle="#0d0a0f";x.fillRect(0,0,W,H);x.fillStyle=g;x.fillRect(0,0,W,H);
+  x.textBaseline="alphabetic";x.textAlign="left";
+  const nm=S.name.trim();
+  if(nm){x.fillStyle=GOLD;x.font=`italic 600 32px ${HF}`;x.fillText(nm,pad,66)}
+  x.fillStyle=IVORY;x.font=`italic 600 78px ${HF}`;x.fillText(fit(x,CONFIG.title,W-pad*2),pad,nm?140:116);
+  let lx=pad;
+  RATES.forEach(([l,c,t],k)=>{x.beginPath();x.arc(lx+11,top-34,11,0,7);x.fillStyle=c;x.fill();x.fillStyle=t;x.font=`600 14px ${BF}`;x.textAlign="center";x.fillText(k+1,lx+11,top-29);x.textAlign="left";x.font=`500 20px ${BF}`;x.fillStyle="#eadfe0";x.fillText(l,lx+30,top-27);lx+=30+x.measureText(l).width+28});
+  place.forEach(({o,k,y,h})=>{
+    const cx=pad+k*(cw+gap),cy=top+y;
+    x.save();rr(x,cx,cy,cw,h,4);x.clip();x.fillStyle=CARD;x.fillRect(cx,cy,cw,h);x.fillStyle="#2a0f1c";x.fillRect(cx,cy,cw,62);x.fillStyle=GOLD;x.fillRect(cx,cy+60,cw,2);x.restore();
+    x.strokeStyle="#2c2231";x.lineWidth=1;rr(x,cx+.5,cy+.5,cw-1,h-1,4);x.stroke();
+    x.fillStyle=IVORY;x.font=`700 42px ${HF}`;x.fillText(fit(x,o.c.name,cw-40),cx+20,cy+44);
+    o.items.forEach((n,r)=>{
+      const iy=cy+TH+r*RH,gw=5*34,gx=[cx+20,cx+20+gw+22];
+      if(r>0){x.fillStyle="#2c2231";x.fillRect(cx+16,iy-4,cw-32,1)}
+      x.fillStyle="#eadfe0";x.font=`600 22px ${BF}`;x.textAlign="left";x.fillText(fit(x,n,cw-40),cx+20,iy+22);
+      rows(o.c).forEach((_,w)=>{
+        const v=get(o.c.name,n,w);
+        x.fillStyle="#9a8f9c";x.font=`500 16px ${BF}`;x.textAlign="left";x.fillText(fit(x,lbl(o.c)[w],gw),gx[w],iy+44);
+        RATES.forEach(([l,c,t],ri)=>{const dx=gx[w]+ri*34+15,dy=iy+66,on=v===ri+1;
+          if(on){x.beginPath();x.arc(dx,dy,19,0,7);x.globalAlpha=.3;x.fillStyle=c;x.fill();x.globalAlpha=1}
+          x.beginPath();x.arc(dx,dy,on?15:13,0,7);
+          if(on){x.fillStyle=c;x.fill();x.strokeStyle="#fff";x.lineWidth=2.5;x.stroke()}
+          else{x.fillStyle=CARD;x.fill();x.globalAlpha=.16;x.fillStyle=c;x.fill();x.globalAlpha=.8;x.strokeStyle=c;x.lineWidth=2;x.stroke();x.globalAlpha=1}
+          x.fillStyle=on?t:c;x.font=`600 ${on?17:14}px ${BF}`;x.textAlign="center";x.fillText(ri+1,dx,dy+(on?6:5));x.textAlign="left"});
+      });
+    });
+  });
+  cv.toBlob(b=>{const a=document.createElement("a");a.href=URL.createObjectURL(b);a.download="my-kinklist.png";a.click();setTimeout(()=>URL.revokeObjectURL(a.href),2000)},"image/png");
+}
+/* ===== codes: pure functions ===== */
+const A32="0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+const layout=()=>{const L=[];CONFIG.categories.forEach((c,ci)=>c.items.forEach((n,ii)=>rows(c).forEach((_,w)=>L.push([ci,ii,w]))));return L};
+const fp=()=>{let h=2166136261;const t=JSON.stringify(CONFIG.categories.map(c=>[c.name,!!c.single,c.items]));for(let i=0;i<t.length;i++){h^=t.charCodeAt(i);h=Math.imul(h,16777619)>>>0}return[0,1,2,3].map(k=>A32[(h>>>(k*5))&31]).join("")};
+const bodyLen=N=>N?Math.ceil((6n**BigInt(N)-1n).toString(2).length/5):1;
+const encName=nm=>{const b=new TextEncoder().encode(Array.from(String(nm||"").trim()).slice(0,24).join(""));let bits=0,acc=0,out="";for(const x of b){acc=(acc<<8)|x;bits+=8;while(bits>=5){out+=A32[(acc>>>(bits-5))&31];bits-=5}acc&=(1<<bits)-1}if(bits)out+=A32[(acc<<(5-bits))&31];return out};
+const decName=t=>{let bits=0,acc=0;const b=[];for(const ch of t){acc=(acc<<5)|A32.indexOf(ch);bits+=5;if(bits>=8){b.push((acc>>>(bits-8))&255);bits-=8;acc&=(1<<bits)-1}}try{return new TextDecoder().decode(new Uint8Array(b)).replace(/[\u0000-\u001f]/g,"").slice(0,24)}catch(e){return""}};
+const fmt=t=>t.match(/.{1,5}/g).join("-");
+function myCode(){
+  const L=layout();let n=0n;
+  for(let k=L.length-1;k>=0;k--){const[ci,ii,w]=L[k],c=CONFIG.categories[ci];n=n*6n+BigInt(get(c.name,c.items[ii],w))}
+  let out="";for(let i=0;i<bodyLen(L.length);i++){out=A32[Number(n&31n)]+out;n>>=5n}
+  return fp()+out+encName(S.name);
+}
+function decode(raw){
+  let t=String(raw).trim();const m=t.match(/r=([^&\s]+)/i);if(m)t=m[1];
+  t=t.toUpperCase().replace(/O/g,"0").replace(/[IL]/g,"1").replace(/[^0-9A-Z]/g,"");
+  const L=layout(),bad={err:"That code doesn't look right. Check that you copied all of it."};
+  if(t.length<5||[...t].some(ch=>!A32.includes(ch)))return bad;
+  if(t.slice(0,4)!==fp())return{err:"This code is from a different checklist, or the checklist was changed after it was made. Ask them to send a fresh code."};
+  const bl=4+bodyLen(L.length);if(t.length<bl)return bad;
+  let n=0n;for(const ch of t.slice(4,bl))n=n*32n+BigInt(A32.indexOf(ch));
+  if(n>=6n**BigInt(L.length))return bad;
+  const v=[];for(let k=0;k<L.length;k++){v.push(Number(n%6n));n/=6n}
+  return{L,v,name:decName(t.slice(bl))};
+}
+/* ===== end codes ===== */
+
+/* ===== compare + dialogs ===== */
+function compareHTML(d){
+  if(d.err)return `<p class="err">${esc(d.err)}</p>`;
+  if(!layout().some(([ci,ii,w])=>w===0&&get(CONFIG.categories[ci].name,CONFIG.categories[ci].items[ii],0)))return `<p class="err">Rate some items first so there is something to compare.</p>`;
+  const same=d.L.every(([ci,ii,w],k)=>get(CONFIG.categories[ci].name,CONFIG.categories[ci].items[ii],w)===d.v[k]);
+  const cats=CONFIG.categories.map(c=>({c,pts:[]})),yes=[],talk=[];
+  d.L.forEach(([ci,ii,w],k)=>{
+    if(w!==0)return;
+    const c=CONFIG.categories[ci],n=c.items[ii],a=get(c.name,n,0),b=d.v[k];
+    if(!a||!b)return;
+    const diff=Math.abs(a-b);cats[ci].pts.push((4-diff)/4);
+    if(a>=4&&b>=4)yes.push(n);
+    if(diff>=2)talk.push([n,a,b,diff]);
+  });
+  const all=cats.flatMap(o=>o.pts);
+  if(!all.length)return `<p class="err">You haven't both rated any of the same items yet.</p>`;
+  const avg=a=>a.reduce((x,y)=>x+y,0)/a.length,pct=Math.round(avg(all)*100);
+  const word=pct>=85?"Very in sync":pct>=70?"Great match":pct>=50?"Some common ground":"Lots to talk about";
+  talk.sort((x,y)=>y[3]-x[3]);
+  const ln=(S.name||"").trim()||"You",tn=d.name||"Them";
+  return (same?`<p class="err">Heads up: these answers are identical to yours. If you pasted your own code, send it to your partner and paste theirs instead.</p>`:"")+`<p class="verdict" style="margin:14px 0 0">${esc(ln)} &amp; ${esc(tn)}</p><div class="big" style="margin-top:4px">${pct}%</div><p class="verdict">${word}</p><p class="mp">Based on ${all.length} item${all.length===1?"":"s"} you both rated.</p>`
+   +cats.filter(o=>o.pts.length).map(o=>{const q=Math.round(avg(o.pts)*100);return `<div class="pc"><div><span>${esc(o.c.name)}</span><span>${q}%</span></div><div class="bar"><i style="width:${q}%"></i></div></div>`}).join("")
+   +`<div class="mh">Yes list</div>`+(yes.length?`<div class="chips">${yes.map(n=>`<span class="chip g">${esc(n)}</span>`).join("")}</div>`:`<p class="mp">Nothing you both rated 4 or 5 yet.</p>`)
+   +`<div class="mh">Let's talk</div>`+(talk.length?`<div class="chips">${talk.map(([n,a,b])=>`<span class="chip t">${esc(n)}<small>${esc(ln)} ${a} · ${esc(tn)} ${b}</small></span>`).join("")}</div>`:`<p class="mp">No big differences. Nice!</p>`);
+}
+const mdl=$("mdl"),mb=$("mbody");
+let CUR={code:"",link:""},PENDING="";
+function openM(html,focusId){mb.innerHTML=html;mdl.hidden=false;const f=focusId&&$(focusId);(f||$("mcl")).focus()}
+function closeM(){mdl.hidden=true;mb.innerHTML=""}
+function openCode(submitted){
+  const L=layout(),done=L.filter(([ci,ii,w])=>get(CONFIG.categories[ci].name,CONFIG.categories[ci].items[ii],w)).length,raw=myCode();
+  CUR={code:fmt(raw),link:location.href.split("#")[0]+"#r="+raw};
+  const intro=!done?"You haven't rated anything yet, so there is nothing to save or share. Rate some items first.":submitted?`Your ratings are saved on this device (${done} of ${L.length} answers). You can come back and change them any time. Send the code or link below to your partner so they can compare.`:"Send this code or link to your partner. They open it, rate their own checklist, and press Compare.";
+  const tip=done&&!S.name.trim()?" Tip: type your name at the top first, so your partner sees it in the results.":"";
+  openM(`<h3>${submitted&&done?"Submitted ✓":"Your code"}</h3><p class="mp">${esc(intro+tip)}</p><code class="cd">${esc(CUR.code)}</code><div class="brow"><button class="btn p" data-copy="code">Copy code</button><button class="btn" data-copy="link">Copy link</button></div><p class="mp" style="margin:14px 0 0">This code contains your answers. Only send it to someone you trust. Nothing is uploaded, and this site never sees it.</p>`);
+}
+function runCompare(){$("cres").innerHTML=compareHTML(decode($("cin").value))}
+function openCompare(pre){
+  openM(`<h3>Compare</h3><p class="mp">Paste your partner's code or link below. Your own current ratings are compared with theirs.</p><textarea class="ta" id="cin" placeholder="Paste their code or link here" spellcheck="false"></textarea><div class="brow"><button class="btn p" data-go="1">Compare</button></div><div id="cres"></div>`,"cin");
+  if(pre){$("cin").value=pre;runCompare()}
+}
+function copyText(t,b){
+  const done=()=>{const o=b.textContent;b.textContent="Copied!";setTimeout(()=>b.textContent=o,1500)};
+  const fb=()=>{const a=document.createElement("textarea");a.value=t;a.style.position="fixed";a.style.opacity="0";document.body.appendChild(a);a.select();try{document.execCommand("copy");done()}catch(e){}a.remove()};
+  if(navigator.clipboard&&navigator.clipboard.writeText)navigator.clipboard.writeText(t).then(done,fb);else fb();
+}
+mb.addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;
+  if(b.dataset.copy)copyText(b.dataset.copy==="code"?CUR.code:CUR.link,b);
+  if(b.dataset.go)runCompare();
+});
+$("mcl").onclick=closeM;
+mdl.addEventListener("click",e=>{if(e.target===mdl)closeM()});
+document.addEventListener("keydown",e=>{if(e.key==="Escape"&&!mdl.hidden)closeM()});
+$("gcd").onclick=()=>openCode(false);
+$("sbm").onclick=()=>openCode(true);
+$("cmp").onclick=()=>openCompare(PENDING);
+$("cnow").onclick=()=>openCompare(PENDING);
+{const hm=location.hash.match(/r=([0-9A-Za-z-]+)/);if(hm){PENDING=hm[1];$("cnote").hidden=false;const pd=decode(PENDING);if(!pd.err&&pd.name)$("cnote").querySelector("span").textContent=pd.name+" shared their results with you. Rate the items you want, then compare."}}
+/* ===== end compare ===== */
+
+$("dl").onclick=()=>exportPNG(false);
+$("dlr").onclick=()=>exportPNG(true);
+renderHead();render();
+</script>
+</body>
+</html>
