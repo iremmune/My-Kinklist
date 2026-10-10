@@ -1,1563 +1,432 @@
-<!doctype html>
-<html lang="en"><head>
-    <script>
-      (function() {
-        // Capture host references before any artifact code runs: Window.parent
-        // is [Replaceable] (a top-level `var parent` in artifact code would
-        // replace the accessor with a data property), and a top-level
-        // `const crypto` would shadow the global — either would otherwise
-        // silently break the bridge for artifacts that worked before.
-        const realParent = window.parent;
-        const cryptoObj = window.crypto;
-        const RealURL = URL;
-        const realDecodeURIComponent = decodeURIComponent;
-        const RealTextEncoder = TextEncoder;
-        const realAtob = atob;
-        // html-to-image is only used by takeScreenshot: fetched on first use, not as a
-        // parser-blocking tag. Native fetch, captured before the proxy override below.
-        const realFetch = typeof window.fetch === 'function' ? window.fetch.bind(window) : null;
-        const HTML_TO_IMAGE_SRC = "https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js";
-        const HTML_TO_IMAGE_INTEGRITY = "sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==";
-        let htmlToImageLoad = null;
-        const loadHtmlToImage = () => {
-          if (!htmlToImageLoad) {
-            htmlToImageLoad = (realFetch
-              ? realFetch(HTML_TO_IMAGE_SRC, { integrity: HTML_TO_IMAGE_INTEGRITY, credentials: 'omit', referrerPolicy: 'no-referrer' })
-              : Promise.reject(new Error('fetch unavailable'))
-            )
-              .then((res) => {
-                if (!res.ok) throw new Error('html-to-image failed to load (' + res.status + ')');
-                return res.text();
-              })
-              .then((source) => {
-                // UMD bundle: hide the artifact's AMD/CommonJS globals so it takes the
-                // window-global branch; inline script text runs synchronously on insert.
-                const hidden = ['define', 'module', 'exports'].map((k) => {
-                  const entry = { k, own: Object.prototype.hasOwnProperty.call(window, k), v: window[k] };
-                  try { window[k] = undefined; } catch (e) {}
-                  return entry;
-                });
-                try {
-                  const el = document.createElement('script');
-                  el.text = source;
-                  (document.head || document.documentElement).appendChild(el);
-                } finally {
-                  hidden.forEach(({ k, own, v }) => {
-                    try { if (own) { window[k] = v; } else { delete window[k]; } } catch (e) {}
-                  });
-                }
-                if (!window.htmlToImage) throw new Error('html-to-image unavailable after load');
-                return window.htmlToImage;
-              });
-            // A failed load may be transient; let the next screenshot retry.
-            htmlToImageLoad.catch(() => { htmlToImageLoad = null; });
-          }
-          return htmlToImageLoad;
-        };
-        // crypto.randomUUID exists only in Secure Contexts; fall back to a
-        // unique non-crypto id elsewhere (http://LAN-IP dev flows) —
-        // uniqueness is what the bridge needs, unpredictability is
-        // defense-in-depth on top of the source guards.
-        const newRequestId =
-          cryptoObj && typeof cryptoObj.randomUUID === "function"
-            ? function () { return cryptoObj.randomUUID(); }
-            : function () { return Date.now() + "-" + Math.random(); };
-        const originalConsole = window.console;
-        window.console = {
-          log: (...args) => {
-            originalConsole.log(...args);
-            realParent.postMessage({ type: 'console', message: args.join(' ') }, '*');
-          },
-          error: (...args) => {
-            originalConsole.error(...args);
-            realParent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
-          },
-          warn: (...args) => {
-            originalConsole.warn(...args);
-            realParent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
-          }
-        };
-
-        // Bridge request ids are crypto-random (not sequential) so they
-        // cannot be predicted by other frames in the tab.
-        let callbacksMap = new Map();
-        let streamControllers = new Map();
-        
-        window.claude = {
-          complete: (prompt) => {
-            return new Promise((resolve, reject) => {
-              const id = newRequestId();
-              callbacksMap.set(id, { resolve, reject });
-              realParent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
-            });
-          }
-        };
-
-        window.storage = {
-          get: (key, shared = false) => {
-            return new Promise((resolve, reject) => {
-              const id = newRequestId();
-              callbacksMap.set(id, { resolve, reject });
-              realParent.postMessage({ type: 'storageGet', id, key, shared }, '*');
-            });
-          },
-          set: (key, value, shared = false) => {
-            return new Promise((resolve, reject) => {
-              const id = newRequestId();
-              callbacksMap.set(id, { resolve, reject });
-              realParent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
-            });
-          },
-          delete: (key, shared = false) => {
-            return new Promise((resolve, reject) => {
-              const id = newRequestId();
-              callbacksMap.set(id, { resolve, reject });
-              realParent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
-            });
-          },
-          list: (prefix, shared = false) => {
-            return new Promise((resolve, reject) => {
-              const id = newRequestId();
-              callbacksMap.set(id, { resolve, reject });
-              realParent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
-            });
-          }
-        };
-
-        let pendingBlobs = new Map();
-        URL.createObjectURL = (blob) => {
-          // Store the blob and create an ID and URL for it
-          const blobId = `blob-${Date.now()}-${Math.random()}`;
-          pendingBlobs.set(blobId, blob);
-          return `blob-request://${blobId}`;
-        };
-
-        URL.revokeObjectURL = (url) => {
-          // Remove the blob from our store
-          const blobId = url.replace("blob-request://", "");
-          pendingBlobs.delete(blobId);
-        };
-
-        const getBlobFromURL = (url) => {
-          const blobId = url.replace("blob-request://", "");
-          return pendingBlobs.get(blobId);
-        };
-
-        // Override global fetch with streaming support
-        window.fetch = (url, init = {}) => {
-          return new Promise((resolve, reject) => {
-            const id = newRequestId();
-            const channelId = `fetch-${id}-${Date.now()}`;
-            
-            callbacksMap.set(id, { 
-              resolve: (response) => {
-                // Null-body statuses: Response(stream, {status: 204}) throws
-                // per the Fetch spec, which would escape this resolver and
-                // hang the artifact's await forever.
-                if (response.status === 204 || response.status === 205 || response.status === 304) {
-                  try {
-                    resolve(new Response(null, {
-                      status: response.status,
-                      statusText: response.statusText,
-                      headers: response.headers
-                    }));
-                  } catch (err) {
-                    // Invalid statusText/header bytes can throw here too.
-                    reject(new TypeError(
-                      'Bridge fetch: unconstructable response (status ' + response.status + ')'
-                    ));
-                  }
-                  return;
-                }
-                // Create a ReadableStream for the response body
-                const stream = new ReadableStream({
-                  start(controller) {
-                    streamControllers.set(channelId, controller);
-                  },
-                  cancel() {
-                    streamControllers.delete(channelId);
-                  }
-                });
-                
-                // Create and return the Response with the stream. Response()
-                // requires status in [200, 599]; an opaque/no-cors fetch
-                // forwards status 0, which would throw here and escape the
-                // resolver, hanging the artifact's await. Surface it as a
-                // network-error-shaped rejection instead.
-                try {
-                  resolve(new Response(stream, {
-                    status: response.status,
-                    statusText: response.statusText,
-                    headers: response.headers
-                  }));
-                } catch (err) {
-                  streamControllers.delete(channelId);
-                  reject(new TypeError(
-                    'Bridge fetch: unconstructable response (status ' + response.status + ')'
-                  ));
-                }
-              },
-              reject,
-              channelId
-            });
-            
-            realParent.postMessage({
-              type: 'proxyFetch',
-              id,
-              url,
-              init,
-              channelId
-            }, '*');
-          });
-        };
-
-        window.addEventListener('message', async (event) => {
-          // Only the embedding parent may drive the bridge — sibling and
-          // nested frames can also postMessage into this window.
-          if (event.source !== realParent) return;
-          if (event.data.type === 'takeScreenshot') {
-            // Echo the request's nonce so the requester can correlate the
-            // reply to ITS request — a reply without the expected nonce
-            // (e.g. from a stale pre-remount artifact) is ignored upstream.
-            const screenshotNonce = event.data.nonce;
-            const rootElement = document.getElementById('artifacts-component-root-html');
-            if (!rootElement) {
-              realParent.postMessage({
-                type: 'screenshotError',
-                nonce: screenshotNonce,
-                error: new Error('Root element not found'),
-              }, '*');
-              return;
-            }
-            // Catch CDN load failures and toPng errors so the parent always
-            // gets a response instead of hanging forever.
-            try {
-              const htmlToImage = await loadHtmlToImage();
-              const screenshot = await htmlToImage.toPng(rootElement, {
-                imagePlaceholder:
-                  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
-              });
-              realParent.postMessage({
-                type: 'screenshotData',
-                nonce: screenshotNonce,
-                data: screenshot,
-              }, '*');
-            } catch (err) {
-              realParent.postMessage({
-                type: 'screenshotError',
-                nonce: screenshotNonce,
-                error: err instanceof Error ? err : new Error(String(err)),
-              }, '*');
-            }
-          } else if (event.data.type === 'claudeComplete') {
-            const callback = callbacksMap.get(event.data.id);
-            if (!callback) return;
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-            } else {
-              callback.resolve(event.data.completion);
-            }
-            callbacksMap.delete(event.data.id);
-          } else if (event.data.type === 'proxyFetchResponse') {
-            const callback = callbacksMap.get(event.data.id);
-            if (!callback) return;
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-              callbacksMap.delete(event.data.id);
-            } else {
-              // Initial response with headers, status, etc.
-              callback.resolve({
-                status: event.data.status,
-                statusText: event.data.statusText,
-                headers: event.data.headers
-              });
-              // Don't delete the callback yet if streaming
-              if (!event.data.body) {
-                callbacksMap.delete(event.data.id);
-              }
-            }
-          } else if (event.data.type === 'proxyFetchStream') {
-            // Handle streaming data chunks
-            const controller = streamControllers.get(event.data.channelId);
-            if (controller) {
-              if (event.data.error) {
-                controller.error(new Error(event.data.error));
-                streamControllers.delete(event.data.channelId);
-              } else if (event.data.done) {
-                controller.close();
-                streamControllers.delete(event.data.channelId);
-                // Clean up the callback
-                const callback = Array.from(callbacksMap.entries()).find(
-                  ([_, value]) => value.channelId === event.data.channelId
-                );
-                if (callback) {
-                  callbacksMap.delete(callback[0]);
-                }
-              } else if (event.data.chunk) {
-                controller.enqueue(new Uint8Array(event.data.chunk));
-              }
-            }
-          } else if (event.data.type === 'storageGet') {
-            const callback = callbacksMap.get(event.data.id);
-            if (!callback) return;
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-            } else {
-              callback.resolve(event.data.result);
-            }
-            callbacksMap.delete(event.data.id);
-          } else if (event.data.type === 'storageSet') {
-            const callback = callbacksMap.get(event.data.id);
-            if (!callback) return;
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-            } else {
-              callback.resolve(event.data.result);
-            }
-            callbacksMap.delete(event.data.id);
-          } else if (event.data.type === 'storageDelete') {
-            const callback = callbacksMap.get(event.data.id);
-            if (!callback) return;
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-            } else {
-              callback.resolve(event.data.result);
-            }
-            callbacksMap.delete(event.data.id);
-          } else if (event.data.type === 'storageList') {
-            const callback = callbacksMap.get(event.data.id);
-            if (!callback) return;
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-            } else {
-              callback.resolve(event.data.result);
-            }
-            callbacksMap.delete(event.data.id);
-          }
-        });
-
-        // An SVG <a> exposes href as an SVGAnimatedString; its baseVal is the attribute
-        // as written, so resolve it against the base URL as the browser does for an HTML <a>.
-        const resolvedHref = (linkEl) => {
-          if (typeof linkEl.href === "string") return linkEl.href;
-          const written = linkEl.href?.baseVal;
-          // A same-document SVG link, such as one that begins an animation, stays with the browser.
-          if (!written || written.trim().startsWith("#")) return "";
-          try {
-            return new RealURL(written, linkEl.baseURI).href;
-          } catch (error) {
-            return written;
-          }
-        };
-
-        // This frame's URL is about:srcdoc, so the browser resolves "#id" against the renderer
-        // page and would load that page in the frame instead of scrolling.
-        const sameDocumentFragment = (linkEl) => {
-          const written = linkEl.getAttribute("href")?.trim();
-          if (!written?.startsWith("#") || document.querySelector("base[href]")) return null;
-          return written.slice(1);
-        };
-
-        const scrollToFragment = (fragment) => {
-          let decoded = fragment;
-          try {
-            decoded = realDecodeURIComponent(fragment);
-          } catch (error) {}
-          let target = document.getElementById(fragment) ?? document.getElementById(decoded);
-          for (const named of target ? [] : document.getElementsByName(decoded)) {
-            if (named.localName === "a") {
-              target = named;
-              break;
-            }
-          }
-          if (target) {
-            target.scrollIntoView();
-          } else if (decoded.toLowerCase() === "top") {
-            window.scrollTo(0, 0);
-          } else {
-            return false;
-          }
-          return true;
-        };
-
-        // Same decoder as dataUrlFile in app/page.tsx; change both together.
-        const hexPair = /^[0-9a-f]{2}$/i;
-        const dataUrlFile = (href) => {
-          const hash = href.indexOf("#");
-          const url = hash === -1 ? href : href.slice(0, hash);
-          const comma = url.indexOf(",");
-          if (comma === -1) return null;
-          const header = url.slice(0, comma);
-          const payload = url.slice(comma + 1);
-          const mimeMatch = header.match(/data:([^;]+)/);
-          const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
-          const declaredBase64 = header
-            .split(";")
-            .slice(1)
-            .some((param) => param.trim().toLowerCase() === "base64");
-          const type = mimeMatch ? mimeMatch[1].trim().toLowerCase() : "";
-          const binaryType = type !== "" && !type.startsWith("text/");
-          if (declaredBase64 || (binaryType && !payload.includes("%"))) {
-            let binary = null;
-            try {
-              binary = realAtob(
-                payload.replace(/%([0-9a-f]{2})/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16))),
-              );
-            } catch (error) {
-              if (declaredBase64) return null;
-            }
-            if (binary !== null) {
-              const bytes = new Uint8Array(binary.length);
-              for (let i = 0; i < binary.length; i++) {
-                bytes[i] = binary.charCodeAt(i);
-              }
-              return { mimeType, data: bytes.buffer };
-            }
-          }
-          const input = new RealTextEncoder().encode(payload);
-          const bytes = new Uint8Array(input.length);
-          let length = 0;
-          for (let i = 0; i < input.length; i++) {
-            if (input[i] === 0x25 && i + 2 < input.length) {
-              const pair = String.fromCharCode(input[i + 1], input[i + 2]);
-              if (hexPair.test(pair)) {
-                bytes[length++] = parseInt(pair, 16);
-                i += 2;
-                continue;
-              }
-            }
-            bytes[length++] = input[i];
-          }
-          return { mimeType, data: bytes.slice(0, length).buffer };
-        };
-
-        window.addEventListener('click', (event) => {
-          // Not instanceof Element: an artifact's own top-level class Element shadows the global.
-          if (typeof event.target?.closest !== "function") return;
-    
-          const linkEl = event.target.closest("a");
-          const href = linkEl && resolvedHref(linkEl);
-          if (!href) return;
-
-          const fragment = sameDocumentFragment(linkEl);
-          if (fragment !== null) {
-            const handledByArtifact = event.defaultPrevented;
-            event.preventDefault();
-            if (handledByArtifact || fragment === "" || scrollToFragment(fragment)) return;
-            // A fragment that names nothing in the artifact may name something in the host,
-            // such as a project thread. The artifact's own listeners still see the click.
-            realParent.postMessage({ type: 'openExternal', href }, '*');
-            return;
-          }
-          const filename = linkEl.getAttribute("download") ?? "";
-    
-          event.preventDefault();
-          event.stopImmediatePropagation();
-    
-          if (href.startsWith("blob-request:")) {
-            const blob = getBlobFromURL(href);
-            if (!blob) return;
-            void blob.arrayBuffer().then((data) => {
-              realParent.postMessage({
-                type: "downloadFile",
-                filename,
-                data,
-                mimeType: blob.type || "application/octet-stream",
-              });
-            });
-          } else if (href.startsWith("data:")) {
-            const file = dataUrlFile(href);
-            if (!file) return;
-            realParent.postMessage({
-              type: "downloadFile",
-              filename,
-              data: file.data,
-              mimeType: file.mimeType,
-            });
-          } else {
-            let linkUrl;
-            try {
-              linkUrl = new URL(href);
-            } catch (error) {
-              return;
-            }
-    
-            if (linkUrl.hostname === window.location.hostname) return;
-      
-            realParent.postMessage({
-              type: 'openExternal',
-              href,
-            }, '*');
-          }
-      });
-
-        const originalOpen = window.open;
-        window.open = function (url) {
-          realParent.postMessage({
-            type: "openExternal",
-            href: url,
-          }, "*");
-        };
-
-        window.addEventListener('error', (event) => {
-          realParent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
-        });
-      })();
-    </script>
-  <style id="claude-scrollbar">@layer claude-scrollbar{*{scrollbar-width:thin}html{scrollbar-color:rgb(128 128 128 / 50%) transparent}}</style><script>
-(function () {
-  "use strict";
-  if (window.__coworkHtmlReviewGuest) return;
-  window.__coworkHtmlReviewGuest = true;
-
-  var READY_TYPE = "__cowork_html_review_ready__";
-  var SEL_CLASS = "__cwhr-sel";
-  var CONTEXT_LEN = 32;
-  var EXACT_CAP = 1000;
-  var port = null;
-  var mode = false;
-  var pins = [];
-  var quotes = [];
-  // Resolved Range per quote id; invalidated on DOM mutation and on a
-  // fresh quotes set. Scroll/resize re-reports just re-read
-  // getClientRects() from the cached Range. Null prototype - ids are
-  // collaborator-writable and must not collide with Object.prototype.
-  var quoteRanges = Object.create(null);
-  var hoverEl = null;
-  var selected = null;
-  var hasTextSel = false;
-  var rafPending = false;
-  // Capture before page body scripts can shadow them; start() defers
-  // to DOMContentLoaded which page code can race.
-  var _MessageChannel = window.MessageChannel;
-  var _topPost = window.top.postMessage.bind(window.top);
-
-  function visibleText(el) {
-    // innerText drops display:none/visibility:hidden subtrees; keep an
-    // empty innerText (icon-only el) rather than falling through to
-    // textContent which would re-include hidden text.
-    var t = typeof el.innerText === "string" ? el.innerText : (el.textContent || "");
-    return t.replace(/\s+/g, " ").trim();
+{
+ "title": "My Kinklist",
+ "subtitle": "Rate each one from 1 (hated) to 5 (very enjoyed). 3 means no opinion.",
+ "categories": [
+  {
+   "name": "Bodies",
+   "single": false,
+   "labels": [
+    "Self",
+    "Partner"
+   ],
+   "items": [
+    "Skinny",
+    "Chubby",
+    "Small Breasts",
+    "Large Breasts",
+    "Small Penises",
+    "Big Penises"
+   ],
+   "info": [
+    "",
+    "",
+    "",
+    "",
+    "",
+    ""
+   ]
+  },
+  {
+   "name": "Anal Play",
+   "single": false,
+   "labels": [
+    "Giving",
+    "Receiving"
+   ],
+   "items": [
+    "Anal toys",
+    "Anal sex, pegging",
+    "Rimming",
+    "Double penetration",
+    "Anal fisting"
+   ],
+   "info": [
+    "",
+    "",
+    "Rimming—technically known as anilingus and often called a \"rim job\"—is a sexual act where a person uses their mouth, lips, or tongue to stimulate a partner's anus",
+    "",
+    ""
+   ]
+  },
+  {
+   "name": "Degradation",
+   "single": false,
+   "labels": [
+    "Giving",
+    "Receiving"
+   ],
+   "items": [
+    "Glory hole",
+    "Name calling",
+    "Humiliation"
+   ],
+   "info": [
+    "A glory hole most commonly refers to a hole in a partition or wall—such as in a public restroom or sex video arcade—used to facilitate anonymous sexual activity between people on opposite sides.",
+    "",
+    ""
+   ]
+  },
+  {
+   "name": "Clothing",
+   "single": false,
+   "labels": [
+    "Self",
+    "Partner"
+   ],
+   "items": [
+    "Fully Clothed",
+    "Lingerie",
+    "Stockings",
+    "Heels",
+    "Leather",
+    "Latex",
+    "Uniform / costume",
+    "Cross-dressing"
+   ],
+   "info": [
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    ""
+   ]
+  },
+  {
+   "name": "No consent",
+   "single": false,
+   "labels": [
+    "Self",
+    "Partner"
+   ],
+   "items": [
+    "Non-con / rape",
+    "Blackmail / coercion",
+    "Kidnapping",
+    "Drugs",
+    "Alcohol",
+    "Sleep play"
+   ],
+   "info": [
+    "",
+    "",
+    "",
+    "",
+    "",
+    "A BDSM or roleplay scenario where partners deliberately simulate a situation involving an unresponsive, exhausted, or sleeping partner."
+   ]
+  },
+  {
+   "name": "Touch & Stimulation",
+   "single": false,
+   "labels": [
+    "Actor",
+    "Subject"
+   ],
+   "items": [
+    "Cock/Pussy worship",
+    "Ass worship",
+    "Foot play",
+    "Tickling",
+    "Sensation play",
+    "Electro stimulation"
+   ],
+   "info": [
+    "",
+    "",
+    "",
+    "",
+    "",
+    ""
+   ]
+  },
+  {
+   "name": "Restrictive",
+   "single": false,
+   "labels": [
+    "Self",
+    "Partner"
+   ],
+   "items": [
+    "Gag",
+    "Collar",
+    "Leash",
+    "Chastity",
+    "Bondage (Light)",
+    "Bondage (Heavy)",
+    "Encasement"
+   ],
+   "info": [
+    "",
+    "",
+    "",
+    "chastity toy (such as a chastity belt or chastity cage) is a locking sexual device designed to cover or restrict the genitals to prevent sexual intercourse or masturbation.",
+    "",
+    "",
+    "Total enclosure fetishism, which is a practice where a person's entire body is tightly sealed, wrapped, or restricted inside a protective or constraining material."
+   ]
+  },
+  {
+   "name": "Taboo",
+   "single": true,
+   "labels": [
+    "Self",
+    "Partner"
+   ],
+   "items": [
+    "Incest",
+    "Age gap",
+    "Raceplay",
+    "Bestiality",
+    "Necrophilia",
+    "Cheating",
+    "Exhibitionism",
+    "Voyeurism"
+   ],
+   "info": [
+    "",
+    "",
+    "Raceplay is a sexual practice within BDSM (bondage, dominance, submission, and sadism/masochism) where participants use real or imagined racial backgrounds, stereotypes, or historical power dynamics to create a sexualized power imbalance.",
+    "Bestiality is the performance of any sexual act or physical contact between a human being and a non-human animal for the purpose of sexual gratification.",
+    "Necrophilia is the act of having sexual intercourse with a dead body, or the desire to do this.",
+    "",
+    "Sexual exhibitionism is the act of deriving sexual arousal or gratification from exposing one's genitals or intimate body parts to other people—often without their consent.",
+    "Voyeurism is the practice of obtaining sexual pleasure or gratification by secretly watching, photographing, or recording unsuspecting people who are naked, undressing, or engaging in sexual activity without their consent."
+   ]
+  },
+  {
+   "name": "Toys",
+   "single": false,
+   "labels": [
+    "Self",
+    "Partner"
+   ],
+   "items": [
+    "Dildos",
+    "Plugs",
+    "Vibrators",
+    "Sounding"
+   ],
+   "info": [
+    "",
+    "",
+    "",
+    "In a sexual or BDSM context, \"sounding\" means inserting a thin, smooth rod, probe, or catheter (called a \"sound\") into the urethra—the tube that carries urine from the bladder out of the body."
+   ]
+  },
+  {
+   "name": "Groupings",
+   "single": true,
+   "labels": [
+    "Self",
+    "Partner"
+   ],
+   "items": [
+    "You and 1 male",
+    "You and 1 female",
+    "You and trans female",
+    "You and trans male",
+    "You and 1 male, 1 female",
+    "You and 2 males",
+    "You and 2 females",
+    "Orgy"
+   ],
+   "info": [
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "An orgy is a wild gathering or party that involves group sexual activity, excessive drinking, or unrestrained revelry"
+   ]
+  },
+  {
+   "name": "Domination",
+   "single": false,
+   "labels": [
+    "Dominant",
+    "Submissive"
+   ],
+   "items": [
+    "Dominant / Submissive",
+    "Domestic servitude",
+    "Slavery",
+    "Pet play",
+    "DD/lg, MD/lb",
+    "Discipline",
+    "Begging",
+    "Forced orgasm",
+    "Orgasm control",
+    "Orgasm denial",
+    "Power exchange"
+   ],
+   "info": [
+    "",
+    "Domestic servitude is a form of modern slavery where people are forced to work inside private homes under abusive conditions, with little or no pay, and no freedom to leave",
+    "",
+    "Pet play is a form of roleplay where adults take on the persona of an animal, such as a dog, cat, or pony, or act as a caregiver (often called a \"handler\").",
+    "DD/LG,B and MD/LG,B are relationship and subculture terms based on age play and BDSM dynamics, describing specific caregiver-and-little roles.\nDD/LG,B (Daddy Dom / Little Girl or Boy)\nMD/LG,B (Mommy Dom / Little Girl or Boy)",
+    "Sexual discipline is the ability to control one's sexual urges and direct sexual energy in ways that match personal values, commitments, and long-term goals, rather than reacting to short-term impulses.",
+    "",
+    "",
+    "Controlling your partner's orgasm.",
+    "Denying your partner permission to orgasm.",
+    "A power exchange is a consensual relationship dynamic where one partner (the submissive, bottom, or service partner) willingly hands over a degree of authority or control to the other partner (the dominant, top, or leader)."
+   ]
+  },
+  {
+   "name": "Fluids",
+   "single": true,
+   "labels": [
+    "Self",
+    "Partner"
+   ],
+   "items": [
+    "Blood",
+    "Watersports",
+    "Scat",
+    "Lactation",
+    "Diapers",
+    "Cum play"
+   ],
+   "info": [
+    "",
+    "",
+    "Scat sex (scientifically known as coprophilia or scatophilia) is a sexual fetish or paraphilia where a person experiences sexual arousal, pleasure, or gratification from feces.",
+    "Erotic lactation (or lactophilia/milk fetishism) refers to sexual arousal, pleasure, or attraction connected to the production, sight, taste, or act of suckling breast milk.",
+    "",
+    ""
+   ]
+  },
+  {
+   "name": "Surrealism",
+   "single": false,
+   "labels": [
+    "Self",
+    "Partner"
+   ],
+   "items": [
+    "Futanari",
+    "Furry",
+    "Vore",
+    "Transformation",
+    "Tentacles",
+    "Monster or Alien"
+   ],
+   "info": [
+    "futanari refers to a fictional female character who possesses both female and male sexual organs (typically a feminine or voluptuous body paired with a functional penis).",
+    "",
+    "Vore (short for vorarephilia) is a sexual fetish or paraphilia involving the erotic desire to consume or be consumed by another person, creature, or entity.",
+    "Transformation fetish is a form of sexual fetishism in which a person becomes sexually aroused by descriptions or depictions of transformations, usually the transformations of people into other beings or objects. It can be considered a paraphilia[citation needed]. Most transformation interests are not paraphilia-based.",
+    "",
+    ""
+   ]
+  },
+  {
+   "name": "Misc. Fetish",
+   "single": false,
+   "labels": [
+    "Giving",
+    "Receiving"
+   ],
+   "items": [
+    "Fisting",
+    "Gangbang",
+    "Breath play",
+    "Impregnation",
+    "Pregnancy",
+    "Feminization",
+    "Cuckold / Cuckquean"
+   ],
+   "info": [
+    "",
+    "a sexual act where one person has sexual intercourse or sexual contact with multiple partners (typically three or more) in a group setting. \n\nUsually involves one central person and a larger group of partners.",
+    "Erotic asphyxiation refers to restricting oxygen to enhance sexual pleasure, arousal, or orgasm.",
+    "",
+    "",
+    "In a sexual or kink context, feminization is a BDSM (bondage, discipline, dominance, submission, and sadomasochism) practice where a submissive partner—typically a man—takes on a feminine role or appearance for erotic or humiliation-based pleasure.",
+    "Cuckold (Sexual Meaning): A man who finds sexual excitement or pleasure from his female partner having sex with someone else.\n\nCuckquean (Sexual Meaning): A woman who finds sexual excitement or pleasure from her male partner having sex with someone else."
+   ]
+  },
+  {
+   "name": "Pain",
+   "single": false,
+   "labels": [
+    "Giving",
+    "Receiving"
+   ],
+   "items": [
+    "Light pain",
+    "Heavy pain",
+    "Nipple clamps",
+    "Clothes pins",
+    "Caning",
+    "Flogging",
+    "Beating",
+    "Spanking",
+    "Cock/Pussy slapping",
+    "Cock/Pussy torture",
+    "Hot Wax",
+    "Scratching",
+    "Biting",
+    "Cutting"
+   ],
+   "info": [
+    "",
+    "",
+    "",
+    "",
+    "Caning refers to impact play where one person strikes another person with a cane (typically made of rattan, wood, or a flexible material) on areas like the buttocks or back for erotic or psychological gratification.",
+    "In a sexual context, flogging refers to a form of impact play where one person strikes another person's body with a multi-stranded leather or synthetic whip (known as a flogger).",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    ""
+   ]
+  },
+  {
+   "name": "General",
+   "single": false,
+   "labels": [
+    "Giving",
+    "Receiving"
+   ],
+   "items": [
+    "Romance / Affection",
+    "Handjob / fingering",
+    "Blowjob",
+    "Deep throat",
+    "Swallowing",
+    "Facials",
+    "Cunnilingus",
+    "Face-sitting",
+    "Edging",
+    "Teasing"
+   ],
+   "info": [
+    "",
+    "",
+    "",
+    "",
+    "",
+    "In a sexual context, a facial refers to a sex act where a person ejaculates onto their partner's face.",
+    "Cunnilingus is a sexual activity that involves the oral stimulation of a woman's external genitalia—including the vulva and clitoris.",
+    "",
+    "",
+    ""
+   ]
   }
-
-  // Comment-mode cursor: the comment bubble itself (a 24px white teardrop,
-  // tail tip bottom-left = the hotspot), drawn by the browser so it has no
-  // lag; the host paints only the inspector box and, on click, the pin.
-  // Same glyph as the host's pins (size-6 rounded-full rounded-bl-[2px]);
-  // cursor images take no CSS shadow, so a slightly stronger 1px ring
-  // stands in for ring + shadow. SVG first (rasterised at device scale
-  // where supported), the same glyph as a 24px PNG for engines without
-  // SVG cursors (WebKit), then the arrow.
-  var BUBBLE_SVG =
-    "<svg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24'>" +
-    "<path d='M12 .5h0A11.5 11.5 0 0 1 23.5 12v0A11.5 11.5 0 0 1 12 23.5H2.5a2 2 0 0 1-2-2V12A11.5 11.5 0 0 1 12 .5Z' fill='#fff' stroke='rgba(0,0,0,0.22)' stroke-width='1'/>" +
-    "</svg>";
-  var BUBBLE_PNG =
-    "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABgAAAAYCAYAAADgdz34AAACjklEQVR4AbRWS2gaURR9TGpiFTUEWpKQkA+EruqizWcRSBRT/G8KKpXiyo0ra1fVNiDFLmypFUo3iht/iO4Uay1FGwtFECl1p6KWLly4CGqrSMTY+wRFQ7WhGYd7Zu697845b+7M8B6BJh+UxcXFG3a7XeTxeHQAC+C12+1+ZLPZhHgMbp8FjLWxAkaj8U48Hg8lEomfIpEoLBaLLTKZTAd4LJFI3kD8HsZ+xGKxoMFgYI9T+JvAtUAg8FylUn3hcDj8ra0t6vLyMmKxWIhCofSAfZyDMRqXy+Wr1eqvPp/vKYjMAEZsRMDpdN6MRCKf+Xz+8cbGBm2kckIAtXShUGgKh8Mnfr9/Ybh0IKDT6a4vLS19EggE+wwGY7jmUj6TyUTQyv35+fmP0MbBexkISKVS+97e3u1LsU0oAo67Go3G1i/pCZjN5t3Nzc0H/zPzPlH/ip8EWvbQYrHs4hwWmN3e3n62traGfZy7MtbX12fYbPYTIKIQOzs7C6urq/cgINVWVlaO4EtjEXq9nken06mksgMZtJthtVp5xNzcHBsEIEWu0Wg0RKVS2USz2WTigFx6hPCkMTfRarXgB6WQzd/j63Q6bdK+nB7j0KnRaCCCIMpTE4D2oEql8m1qAvV6/VSr1U5PIJvN+qFjv6fyBIVC4ZfD4XgJAmekC9RqNZROp1+FQqESCCDSBWCVO1EoFC8wOQZpAnjm0Wj0O/xX94H4HNAzotvtNnreFU6lUgllMplAMpnclcvlp8NURC6Xi8BLGc5N9NvtNqpWq6hcLqN8Pn8OLUkAMe/g4EAOG4WzizcTJpPpA6zFIpfL9Ra2I45/IRgM2lKp1LtisXjs9XpvHR4eHimVythF4n78BwAA//8r8OPFAAAABklEQVQDAPCY8Oae0TJxAAAAAElFTkSuQmCC";
-  var BUBBLE_CURSOR =
-    "url(\"data:image/svg+xml," + encodeURIComponent(BUBBLE_SVG) + "\") 1 23, " +
-    "url(\"" + BUBBLE_PNG + "\") 1 23, default";
-
-  function injectStyle() {
-    var style = document.createElement("style");
-    // Hover box is painted by the host (from streamed rects); the guest
-    // marks the selected element and, in comment mode, swaps the native
-    // cursor for the comment bubble (forced, so page cursor styles don't
-    // fight the picker). While a composer or thread card is open the arrow
-    // returns, so the bubble cursor and the pin just placed never show at
-    // once. Keyed on <html> data attributes, which page scripts that
-    // rewrite body.className leave alone; ":not(#_)" lifts the rules to
-    // id-level specificity so a page's own !important cursor rules lose.
-    var ANY = ":not(#__cwhr_)";
-    var MODE = "html[data-cwhr-mode]";
-    var COMPOSING = MODE + "[data-cwhr-composing]";
-    style.textContent =
-      "." + SEL_CLASS + "{outline:1px solid hsl(40 70% 40%) !important;outline-offset:0;}" +
-      MODE + ANY + "," + MODE + " " + ANY + "{cursor:" + BUBBLE_CURSOR + " !important;}" +
-      COMPOSING + ANY + "," + COMPOSING + " " + ANY + "{cursor:default !important;}";
-    (document.head || document.documentElement).appendChild(style);
-  }
-
-  function isUnique(sel) {
-    try {
-      return document.querySelectorAll(sel).length === 1;
-    } catch (e) {
-      return false;
-    }
-  }
-
-  // Mirrors the host's stripInvisibles ranges. The host strips these
-  // from stored selectors, so a selector built on a value containing
-  // them would validate here but never match again - skip those rungs
-  // and fall through to the structural ladder instead.
-  function hasInvisibles(s) {
-    for (var i = 0; i < s.length; i++) {
-      var c = s.codePointAt(i);
-      if (c > 0xffff) i++;
-      if (
-        c <= 0x1f ||
-        c === 0x061c ||
-        c === 0x070f ||
-        c === 0xad ||
-        (c >= 0x7f && c <= 0x9f) ||
-        c === 0x115f ||
-        c === 0x1160 ||
-        c === 0x180e ||
-        (c >= 0x200b && c <= 0x200f) ||
-        (c >= 0x202a && c <= 0x202e) ||
-        (c >= 0x2060 && c <= 0x2064) ||
-        (c >= 0x2066 && c <= 0x2069) ||
-        c === 0x3164 ||
-        c === 0xfeff ||
-        (c >= 0xfff9 && c <= 0xfffb) ||
-        c === 0xffa0 ||
-        (c >= 0xe0000 && c <= 0xe007f)
-      ) {
-        return true;
-      }
-    }
-    return false;
-  }
-
-  function escapeAttr(v) {
-    return String(v).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
-  }
-
-  // Selector ladder: unique #id -> unique [data-*] -> structural
-  // tag:nth-of-type path rooted at the nearest unique-id ancestor.
-  function selectorFor(el) {
-    if (el.id && !hasInvisibles(el.id) && isUnique("#" + CSS.escape(el.id))) {
-      return "#" + CSS.escape(el.id);
-    }
-    for (var i = 0; i < el.attributes.length; i++) {
-      var attr = el.attributes[i];
-      if (
-        attr.name.indexOf("data-") === 0 &&
-        attr.value &&
-        !hasInvisibles(attr.value)
-      ) {
-        var dataSel = "[" + attr.name + '="' + escapeAttr(attr.value) + '"]';
-        if (isUnique(dataSel)) return dataSel;
-      }
-    }
-    var parts = [];
-    var cur = el;
-    while (cur && cur !== document.body && cur.nodeType === 1 && parts.length < 10) {
-      var sel = cur.tagName.toLowerCase();
-      var parent = cur.parentElement;
-      if (parent) {
-        var sameTag = [];
-        for (var c = 0; c < parent.children.length; c++) {
-          if (parent.children[c].tagName === cur.tagName) sameTag.push(parent.children[c]);
-        }
-        if (sameTag.length > 1) {
-          sel += ":nth-of-type(" + (sameTag.indexOf(cur) + 1) + ")";
-        }
-      }
-      parts.unshift(sel);
-      if (
-        parent &&
-        parent.id &&
-        !hasInvisibles(parent.id) &&
-        isUnique("#" + CSS.escape(parent.id))
-      ) {
-        parts.unshift("#" + CSS.escape(parent.id));
-        return parts.join(" > ");
-      }
-      cur = parent;
-    }
-    if (cur === document.body) {
-      parts.unshift("body");
-      return parts.join(" > ");
-    }
-    // Depth cap hit without a root - an unrooted chain would match the
-    // first structural pattern anywhere in the document. Mark the pin
-    // detached instead of attaching it to the wrong element.
-    return ":not(*)";
-  }
-
-  function descriptorFor(el) {
-    var tag = "<" + el.tagName.toLowerCase() + ">";
-    var idPart = el.id ? " #" + el.id : "";
-    var text = visibleText(el).slice(0, 60);
-    var textPart = text ? ' "' + text + '"' : "";
-    // Nearest id'd ancestor, skipping the UCR-injected
-    // #artifacts-component-root-* wrapper which is implementation noise.
-    var section = el.parentElement;
-    while (
-      section &&
-      (!section.id || section.id.indexOf("artifacts-component-root") === 0)
-    ) {
-      section = section.parentElement;
-    }
-    var sectionPart = section && section.id ? " in #" + section.id : "";
-    return (tag + idPart + textPart + sectionPart).slice(0, 400);
-  }
-
-  // textContent offset of (node, offset) within body - the coordinate
-  // system text-quote anchors are stored in. -1 when the boundary
-  // isn't under body (shadow root, detached).
-  function textOffset(node, offset) {
-    var body = document.body;
-    if (!body) return -1;
-    try {
-      var pre = document.createRange();
-      pre.selectNodeContents(body);
-      pre.setEnd(node, offset);
-      return pre.toString().length;
-    } catch (e) {
-      return -1;
-    }
-  }
-
-  // Inverse: build a Range covering [start, end) in body.textContent.
-  function rangeForOffsets(start, end) {
-    var body = document.body;
-    if (!body) return null;
-    var walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT);
-    var acc = 0;
-    var range = document.createRange();
-    var haveStart = false;
-    var t;
-    while ((t = walker.nextNode())) {
-      var next = acc + t.length;
-      if (!haveStart && start < next) {
-        range.setStart(t, start - acc);
-        haveStart = true;
-      }
-      if (haveStart && end <= next) {
-        range.setEnd(t, end - acc);
-        return range;
-      }
-      acc = next;
-    }
-    return null;
-  }
-
-  // Context-scored search (W3C text-quote resolution): slice-check the
-  // hint, else pick the occurrence whose surrounding chars best match
-  // prefix/suffix. MIRRORS locateTextQuote() above line-for-line - the
-  // tested export is the contract; this copy is what the sandbox runs.
-  function locateQuote(text, q) {
-    var ex = q.exact;
-    if (!ex) return null;
-    var hint = q.startOffset >= 0 ? q.startOffset : 0;
-    if (text.slice(hint, hint + ex.length) === ex) {
-      return { start: hint, end: hint + ex.length };
-    }
-    var best = -1;
-    var bestScore = -1;
-    var bestDist = Infinity;
-    var scanned = 0;
-    for (var idx = text.indexOf(ex); idx !== -1 && ++scanned <= 1000; idx = text.indexOf(ex, idx + 1)) {
-      var before = text.slice(Math.max(0, idx - CONTEXT_LEN), idx);
-      var after = text.slice(idx + ex.length, idx + ex.length + CONTEXT_LEN);
-      var sc = 0;
-      for (var i = 1; i <= q.prefix.length && i <= before.length; i++) {
-        if (q.prefix[q.prefix.length - i] !== before[before.length - i]) break;
-        sc++;
-      }
-      for (var j = 0; j < q.suffix.length && j < after.length; j++) {
-        if (q.suffix[j] !== after[j]) break;
-        sc++;
-      }
-      var dist = Math.abs(idx - hint);
-      if (sc > bestScore || (sc === bestScore && dist < bestDist)) {
-        best = idx;
-        bestScore = sc;
-        bestDist = dist;
-      }
-    }
-    return best === -1 ? null : { start: best, end: best + ex.length };
-  }
-
-  function collectLineRects(range, cap) {
-    var out = [];
-    var rects = range.getClientRects();
-    for (var i = 0; i < rects.length && out.length < cap; i++) {
-      var r = rects[i];
-      if (r.width > 0 && r.height > 0) {
-        out.push({ x: r.left, y: r.top, w: r.width, h: r.height });
-      }
-    }
-    return out;
-  }
-
-  function reportTextSel(full) {
-    if (!port) return;
-    var sel = window.getSelection();
-    var r = sel && !sel.isCollapsed && sel.rangeCount > 0 ? sel.getRangeAt(0) : null;
-    if (!r || !document.body || !document.body.contains(r.commonAncestorContainer)) {
-      if (hasTextSel) {
-        hasTextSel = false;
-        port.postMessage({ type: "textClear" });
-      }
-      return;
-    }
-    hasTextSel = true;
-    var br = r.getBoundingClientRect();
-    var msg = {
-      type: "textCapture",
-      rect: { x: br.left, y: br.top, w: br.width, h: br.height },
-      lineRects: collectLineRects(r, 80),
-    };
-    if (full) {
-      var live = document.body.textContent || "";
-      var so = textOffset(r.startContainer, r.startOffset);
-      var eo = textOffset(r.endContainer, r.endOffset);
-      if (so < 0 || eo < 0 || eo <= so) {
-        // Unanchorable selection (shadow root, foreign node). A
-        // rect-only post here would make the host pair the new rect
-        // with a stale prior anchor - clear instead.
-        hasTextSel = false;
-        port.postMessage({ type: "textClear" });
-        return;
-      }
-      // Denomination invariant: exact/prefix/suffix are byte-identical
-      // slices of body.textContent. Truncation adjusts endOffset so
-      // the host's (endOffset - startOffset === exact.length) shape
-      // check holds. Cut points back off surrogate halves - a lone
-      // surrogate would never relocate and fails UTF-8 persist.
-      var capped = Math.min(eo, so + EXACT_CAP);
-      if (capped < eo) {
-        var hc = live.charCodeAt(capped - 1);
-        if (hc >= 0xd800 && hc <= 0xdbff) capped--;
-      }
-      if (capped <= so) {
-        port.postMessage(msg);
-        return;
-      }
-      var pStart = Math.max(0, so - CONTEXT_LEN);
-      var pc = live.charCodeAt(pStart);
-      if (pc >= 0xdc00 && pc <= 0xdfff) pStart++;
-      var sEnd = Math.min(live.length, capped + CONTEXT_LEN);
-      if (sEnd < live.length) {
-        var sc = live.charCodeAt(sEnd - 1);
-        if (sc >= 0xd800 && sc <= 0xdbff) sEnd--;
-      }
-      msg.exact = live.slice(so, capped);
-      msg.prefix = live.slice(pStart, so);
-      msg.suffix = live.slice(capped, sEnd);
-      msg.startOffset = so;
-      msg.endOffset = capped;
-    }
-    port.postMessage(msg);
-  }
-
-  function clearSelection() {
-    if (selected) {
-      selected.classList.remove(SEL_CLASS);
-      selected = null;
-    }
-  }
-
-  // rAF-throttled cursor + hover-rect stream so the host can paint the
-  // inspector hover box (and knows the pointer is present) in comment mode.
-  var cursorPending = false;
-  var cursorX = -1;
-  var cursorY = -1;
-  function flushCursor() {
-    cursorPending = false;
-    if (!port) return;
-    var hover = null;
-    if (
-      hoverEl &&
-      hoverEl.nodeType === 1 &&
-      hoverEl !== document.body &&
-      hoverEl !== document.documentElement
-    ) {
-      var r = hoverEl.getBoundingClientRect();
-      if (r.width > 0 || r.height > 0) {
-        hover = { x: r.left, y: r.top, w: r.width, h: r.height };
-      }
-    }
-    port.postMessage({ type: "cursor", x: cursorX, y: cursorY, hover: hover });
-  }
-  function scheduleCursor() {
-    if (!cursorPending) {
-      cursorPending = true;
-      requestAnimationFrame(flushCursor);
-    }
-  }
-  function onMouseMove(ev) {
-    if (!mode || !port) return;
-    // Over the scrollbar gutter (clientX/Y past the content box) - hide
-    // the hover box like a leave.
-    var de = document.documentElement;
-    if (ev.clientX >= de.clientWidth || ev.clientY >= de.clientHeight) {
-      cursorX = -1;
-      cursorY = -1;
-      hoverEl = null;
-      scheduleCursor();
-      return;
-    }
-    cursorX = ev.clientX;
-    cursorY = ev.clientY;
-    hoverEl = ev.target;
-    scheduleCursor();
-  }
-  function onMouseLeave() {
-    if (!mode || !port) return;
-    cursorX = -1;
-    cursorY = -1;
-    hoverEl = null;
-    scheduleCursor();
-  }
-
-  function onClick(ev) {
-    if (!port) return;
-    if (!mode) {
-      // Mode off: don't intercept the page, just let the host close any
-      // open popover (thread card click-away). A non-collapsed selection
-      // means the click ended a drag-select - not a click-away.
-      var s = window.getSelection();
-      if (!s || s.isCollapsed) port.postMessage({ type: "clickAway" });
-      return;
-    }
-    ev.preventDefault();
-    ev.stopImmediatePropagation();
-    var el = ev.target;
-    if (!el || el.nodeType !== 1 || el === document.documentElement) return;
-    if (el === document.body && el.firstElementChild) {
-      // Pin on body is rarely intentional; keep it anyway but as body.
-    }
-    clearSelection();
-    selected = el;
-    el.classList.add(SEL_CLASS);
-    var rect = el.getBoundingClientRect();
-    var pinX = rect.width > 0 ? (ev.clientX - rect.left) / rect.width : 0.5;
-    var pinY = rect.height > 0 ? (ev.clientY - rect.top) / rect.height : 0.5;
-    port.postMessage({
-      type: "capture",
-      selector: selectorFor(el).slice(0, 1000),
-      textHint: visibleText(el).slice(0, 300),
-      descriptor: descriptorFor(el),
-      pinX: Math.min(1, Math.max(0, pinX)),
-      pinY: Math.min(1, Math.max(0, pinY)),
-      clientX: ev.clientX,
-      clientY: ev.clientY,
-      rectLeft: rect.left,
-      rectTop: rect.top,
-    });
-  }
-
-  function reportRects() {
-    rafPending = false;
-    if (!port) return;
-    // Selected element's live bounds - keeps the host's draft pin /
-    // inspector tag / composer glued through scroll and reflow.
-    if (selected) {
-      var sr = selected.getBoundingClientRect();
-      port.postMessage({
-        type: "selRect",
-        left: sr.left,
-        top: sr.top,
-        w: sr.width,
-        h: sr.height,
-        found:
-          (sr.width > 0 || sr.height > 0) &&
-          document.documentElement.contains(selected),
-      });
-    }
-    var rects = [];
-    for (var i = 0; i < pins.length; i++) {
-      var p = pins[i];
-      var el = null;
-      try {
-        el = document.querySelector(p.selector);
-      } catch (e) {
-        el = null;
-      }
-      if (!el) {
-        rects.push({ id: p.id, x: 0, y: 0, found: false });
-        continue;
-      }
-      var r = el.getBoundingClientRect();
-      if (r.width === 0 && r.height === 0) {
-        rects.push({ id: p.id, x: 0, y: 0, found: false });
-        continue;
-      }
-      rects.push({
-        id: p.id,
-        x: r.left + p.pinX * r.width,
-        y: r.top + p.pinY * r.height,
-        found: true,
-      });
-    }
-    var quoteRects = [];
-    if (quotes.length > 0) {
-      var live = null;
-      for (var qi = 0; qi < quotes.length; qi++) {
-        var q = quotes[qi];
-        var qr = quoteRanges[q.id];
-        if (qr === undefined) {
-          if (live === null) {
-            live = (document.body && document.body.textContent) || "";
-          }
-          var loc = locateQuote(live, q);
-          qr = (loc && rangeForOffsets(loc.start, loc.end)) || null;
-          quoteRanges[q.id] = qr;
-        }
-        // Zero paintable rects (display:none subtree) reports as
-        // not-found so the host docks it as detached instead of
-        // rendering nothing clickable.
-        var qlr = qr ? collectLineRects(qr, 80) : [];
-        quoteRects.push(
-          qlr.length > 0
-            ? { id: q.id, found: true, lineRects: qlr }
-            : { id: q.id, found: false, lineRects: [] }
-        );
-      }
-    }
-    port.postMessage({
-      type: "rects",
-      rects: rects,
-      quoteRects: quoteRects,
-      scrollY: window.scrollY || 0,
-    });
-  }
-
-  function scheduleRects() {
-    if (rafPending) return;
-    rafPending = true;
-    var done = false;
-    function run() {
-      if (done) return;
-      done = true;
-      reportRects();
-    }
-    // rAF for paint alignment, with a timeout fallback - rAF is
-    // suspended entirely in hidden tabs and pins must still settle
-    // when the tab becomes visible after background loading.
-    requestAnimationFrame(run);
-    setTimeout(run, 150);
-  }
-
-  function setMode(on) {
-    mode = !!on;
-    document.documentElement.toggleAttribute("data-cwhr-mode", mode);
-    if (!mode) {
-      hoverEl = null;
-      clearSelection();
-    }
-  }
-
-  function setComposing(open) {
-    document.documentElement.toggleAttribute("data-cwhr-composing", !!open);
-  }
-
-  function onPortMessage(ev) {
-    var data = ev.data;
-    if (!data) return;
-    if (data.type === "mode") setMode(data.on);
-    else if (data.type === "composing") setComposing(data.open);
-    else if (data.type === "pins") {
-      pins = Array.isArray(data.pins) ? data.pins : [];
-      scheduleRects();
-    } else if (data.type === "quotes") {
-      quotes = Array.isArray(data.quotes) ? data.quotes : [];
-      quoteRanges = Object.create(null);
-      scheduleRects();
-    } else if (data.type === "clearSelection") {
-      clearSelection();
-    } else if (data.type === "clearTextSel") {
-      var ts = window.getSelection();
-      if (ts) ts.removeAllRanges();
-      hasTextSel = false;
-    } else if (data.type === "restoreScroll") {
-      var ry = Number(data.y);
-      if (isFinite(ry) && ry > 0) {
-        // Apply now and again at load - late images/fonts can grow the
-        // document after the first attempt clamps short.
-        window.scrollTo(0, ry);
-        window.addEventListener("load", function () {
-          window.scrollTo(0, ry);
-        });
-      }
-    }
-  }
-
-  function start() {
-    injectStyle();
-    var channel = new _MessageChannel();
-    port = channel.port1;
-    port.onmessage = onPortMessage;
-    // Sandboxed srcdoc origins can be opaque; "*" is required. The
-    // payload carries only the mount token (multiple sandboxes can be
-    // mounted at once - the token routes the port to the right overlay)
-    // and the channel port itself is pairwise-secure.
-    _topPost(
-      { type: READY_TYPE, token: "08d7655d-fbfc-48af-a6ce-53c75c950b87" },
-      "*",
-      [channel.port2]
-    );
-    document.addEventListener("mousemove", onMouseMove, true);
-    // documentElement (not document, capture) so this fires only when the
-    // pointer leaves the viewport - capture-phase on document would fire for
-    // every intra-document element-boundary crossing.
-    document.documentElement.addEventListener("mouseleave", onMouseLeave);
-    document.addEventListener("click", onClick, true);
-    // Text-selection capture: commit on mouseup/keyup (Shift+Arrow),
-    // clear on collapse. Not mode-gated; highlight-to-comment is
-    // always on.
-    function onSelCommit() { reportTextSel(true); }
-    document.addEventListener("mouseup", onSelCommit, true);
-    document.addEventListener("keyup", onSelCommit, true);
-    document.addEventListener("selectionchange", function () {
-      var s = window.getSelection();
-      if (hasTextSel && (!s || s.isCollapsed)) reportTextSel(false);
-    });
-    document.addEventListener("keydown", function (ev) {
-      if (ev.key === "Escape" && port) port.postMessage({ type: "dismiss" });
-    }, true);
-    // Scroll/resize move the hovered element under a stationary pointer -
-    // re-report its rect so the host's inspector box tracks it. Mutations
-    // stay rects-only (animating pages would chatter the cursor stream).
-    var textSelPending = false;
-    function scheduleTextSel() {
-      if (textSelPending) return;
-      textSelPending = true;
-      requestAnimationFrame(function () {
-        textSelPending = false;
-        reportTextSel(false);
-      });
-    }
-    function onLayoutChange() {
-      scheduleRects();
-      if (mode && hoverEl) scheduleCursor();
-      if (hasTextSel) scheduleTextSel();
-    }
-    window.addEventListener("scroll", onLayoutChange, true);
-    window.addEventListener("resize", onLayoutChange);
-    // Full-cache invalidate per childList mutation is acceptable: CSS
-    // animation doesn't fire the observer; JS writers at frame rate
-    // would re-relocate every frame but are rare. characterData isn't
-    // observed, so .data= edits leave highlights stale until the next
-    // childList mutation.
-    var observer = new MutationObserver(function () {
-      quoteRanges = Object.create(null);
-      scheduleRects();
-      if (hasTextSel) scheduleTextSel();
-    });
-    function observe() {
-      if (document.body) observer.observe(document.body, { childList: true, subtree: true });
-    }
-    if (document.body) observe();
-    else document.addEventListener("DOMContentLoaded", observe);
-    // Settle pins after late layout (fonts, images).
-    setInterval(scheduleRects, 2000);
-  }
-
-  if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", start);
-  } else {
-    start();
-  }
-})();
-</script>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>My Kinklist</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,600;0,700;1,600&amp;family=Jost:wght@400;500;600&amp;display=swap" rel="stylesheet">
-<style>
-:root{--bg:#0d0a0f;--card:#171219;--line:#2c2231;--ink:#eadfe0;--muted:#9a8f9c;--gold:#b08d57;--wine:#2a0f1c;--hf:"Cormorant Garamond",Georgia,serif;--bf:"Jost",system-ui,sans-serif}
-*{box-sizing:border-box}
-body{margin:0;background:radial-gradient(900px 420px at 50% -120px,#2b0f1e 0%,transparent 70%),var(--bg);color:var(--ink);font-family:var(--bf);min-height:100vh}
-.top{max-width:1300px;margin:0 auto;padding:30px 16px 8px}
-.head{display:flex;flex-wrap:wrap;gap:16px;align-items:flex-end;justify-content:space-between}
-h1{font-family:var(--hf);font-style:italic;font-weight:600;font-size:clamp(2.6rem,7vw,4.4rem);line-height:1;margin:6px 0 8px;color:#f3e6dc;letter-spacing:.01em}
-.sub{margin:0;color:var(--muted);max-width:60ch;font-size:.98rem}
-.nm{font:italic 600 1.35rem var(--hf);background:transparent;border:0;border-bottom:1px solid var(--gold);color:var(--gold);padding:2px 0;width:min(320px,100%)}
-.nm::placeholder{color:#7b6847}
-input:focus,button:focus-visible{outline:2px solid var(--gold);outline-offset:3px}
-.acts{display:flex;gap:8px;flex-wrap:wrap}
-.btn{font:500 .95rem var(--bf);letter-spacing:.03em;border:1px solid var(--gold);background:transparent;color:#f3e6dc;border-radius:4px;padding:10px 16px;cursor:pointer;transition:background .2s,color .2s}
-.btn:hover{background:rgba(176,141,87,.16)}
-.btn.p{background:var(--gold);color:#1a1210;font-weight:600}
-.btn.p:hover{background:#c4a06a}
-.btn.sm{padding:6px 12px;font-size:.85rem}
-.legend{display:flex;flex-wrap:wrap;gap:8px 20px;margin:22px 0 6px;font-size:.92rem;color:var(--ink)}
-.legend span{display:inline-flex;align-items:center;gap:8px}
-.legend i{display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;border-radius:50%;font:600 12px var(--bf);font-style:normal;color:var(--t)}
-.cols{max-width:1300px;margin:0 auto;padding:10px 16px 50px;columns:3 340px;column-gap:20px}
-.card{break-inside:avoid;background:var(--card);border:1px solid var(--line);border-radius:4px;margin:0 0 20px;padding:0 0 12px;overflow:hidden;box-shadow:0 14px 30px -18px #000}
-.card h2{margin:0 0 10px;padding:14px 18px 12px;background:var(--wine);border-bottom:2px solid var(--gold);font:700 2.05rem/1.1 var(--hf);color:#f3e6dc;letter-spacing:.01em}
-.it{padding:9px 12px 9px 18px;margin:0 6px;border-radius:3px}
-.it+.it{border-top:1px solid var(--line)}
-.it .n{display:block;font-weight:600;font-size:1.05rem;padding:2px 0 5px}
-.inf{display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;margin-left:8px;border-radius:50%;border:1px solid var(--gold);background:transparent;color:var(--gold);font:italic 600 13px var(--hf);cursor:pointer;padding:0;vertical-align:middle}
-.inf:hover,.inf[aria-expanded=true]{background:rgba(176,141,87,.22)}
-.info{margin:2px 0 8px;padding:8px 10px;border-left:2px solid var(--gold);background:#1f1824;color:var(--ink);font-size:.92rem;line-height:1.4;white-space:pre-wrap}
-.info[hidden]{display:none}
-.pair{display:flex;flex-wrap:wrap;gap:8px 18px}
-.gl{display:block;font-size:.85rem;color:var(--muted);margin:0 0 4px}
-.dots{display:flex;gap:6px;align-items:center}
-.dots button{display:inline-flex;align-items:center;justify-content:center;width:30px;height:30px;border-radius:50%;font:600 13px var(--bf);background:color-mix(in srgb,var(--c) 14%,#1f1824);border:2px solid color-mix(in srgb,var(--c) 75%,transparent);color:var(--c);cursor:pointer;padding:0;touch-action:manipulation;transition:transform .15s,background .15s,box-shadow .15s}
-.dots button:hover{background:color-mix(in srgb,var(--c) 32%,#1f1824);transform:scale(1.1)}
-.dots button.on{background:var(--c);border-color:#fff;color:var(--t);transform:scale(1.2);box-shadow:0 0 0 4px color-mix(in srgb,var(--c) 35%,transparent),0 0 18px color-mix(in srgb,var(--c) 55%,transparent)}
-.dots button.pop{animation:pick .5s cubic-bezier(.3,1.5,.5,1)}
-@keyframes pick{0%{transform:scale(.7);box-shadow:0 0 0 0 color-mix(in srgb,var(--c) 60%,transparent)}55%{transform:scale(1.55);box-shadow:0 0 0 16px color-mix(in srgb,var(--c) 0%,transparent)}100%{transform:scale(1.2);box-shadow:0 0 0 4px color-mix(in srgb,var(--c) 35%,transparent),0 0 18px color-mix(in srgb,var(--c) 55%,transparent)}}
-.it.flash{animation:flash .8s ease-out}
-@keyframes flash{0%{background:color-mix(in srgb,var(--rc) 50%,var(--card))}100%{background:color-mix(in srgb,var(--rc) 16%,var(--card))}}
-.tools{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px;margin:20px 0 0}
-.tg{min-width:0;border:1px solid var(--line);background:rgba(23,18,25,.75);border-radius:4px;padding:12px 14px 14px}
-.tg h4{margin:0 0 10px;font:600 .72rem var(--bf);letter-spacing:.16em;text-transform:uppercase;color:var(--gold)}
-.tg .brow{display:grid;grid-template-columns:1fr 1fr;gap:8px}
-.tg .btn{width:100%;padding:10px 8px;font-size:.88rem;line-height:1.2;text-align:center}
-.tg .btn.wide{grid-column:1/-1}
-.modal{position:fixed;inset:0;z-index:50;background:rgba(5,3,7,.8);display:flex;justify-content:center;align-items:flex-start;padding:16px 14px 24px;overflow:auto}
-.modal[hidden]{display:none}
-.mbox{position:relative;width:min(580px,100%);margin:auto 0;background:var(--card);border:1px solid var(--line);border-top:2px solid var(--gold);border-radius:4px;padding:22px 20px 20px;box-shadow:0 30px 60px -20px #000}
-.mbox h3{margin:0 40px 6px 0;font:700 2rem/1.1 var(--hf);color:#f3e6dc}
-.mx{position:absolute;top:10px;right:10px;width:34px;height:34px;border-radius:4px;border:1px solid var(--line);background:#1f1824;color:var(--ink);cursor:pointer;font:500 15px var(--bf);padding:0}
-.mx:hover{border-color:var(--gold)}
-.mp{margin:0 0 12px;color:var(--muted);font-size:.92rem;line-height:1.45}
-.cd{display:block;word-break:break-all;background:#1f1824;border:1px solid var(--line);border-radius:3px;padding:12px;font:500 1.05rem/1.5 ui-monospace,Menlo,Consolas,monospace;color:var(--gold);letter-spacing:.05em;margin:0 0 12px}
-.ta{display:block;width:100%;min-height:84px;background:#1f1824;border:1px solid var(--line);color:var(--ink);border-radius:3px;padding:10px;font:500 .95rem ui-monospace,Menlo,Consolas,monospace;margin:0 0 10px;resize:vertical}
-.brow{display:flex;gap:8px;flex-wrap:wrap}
-.big{font:italic 600 4.4rem/1 var(--hf);color:var(--gold);margin:14px 0 2px}
-.verdict{font:600 1.2rem var(--hf);color:#f3e6dc;margin:0 0 4px}
-.bar{height:8px;background:#1f1824;border-radius:4px;overflow:hidden}
-.bar i{display:block;height:100%;background:var(--gold)}
-.pc{margin:10px 0}
-.pc div:first-child{display:flex;justify-content:space-between;font-size:.95rem;margin-bottom:4px}
-.mh{font:700 1.35rem var(--hf);color:#f3e6dc;margin:20px 0 8px}
-.chips{display:flex;flex-wrap:wrap;gap:6px}
-.chip{padding:4px 10px;border-radius:99px;border:1px solid var(--line);background:#1f1824;font-size:.88rem}
-.chip.g{border-color:rgba(53,224,138,.45);color:#bff5d8}
-.chip.t{border-color:rgba(224,128,95,.6)}
-.chip small{color:var(--muted);margin-left:4px}
-.err{color:#e0805f;margin:0 0 10px;font-size:.92rem}
-.cmpnote{margin:14px 0 0;padding:10px 14px;border:1px solid var(--gold);border-radius:4px;color:var(--gold);font-size:.95rem;display:flex;gap:12px;align-items:center;flex-wrap:wrap}
-.cmpnote[hidden]{display:none}
-.foot{text-align:center;color:#6f6473;font-size:.85rem;padding:0 16px 40px}
-
-/* ---- owner edit mode ---- */
-body.edit .viewonly{display:none}
-.editnote{max-width:1300px;margin:14px auto 0;padding:10px 14px;border:1px dashed var(--gold);border-radius:4px;color:var(--gold);font-size:.92rem}
-.ti,.si{display:block;width:100%;background:transparent;border:0;border-bottom:1px dashed var(--gold);color:inherit;font:inherit;padding:0 0 2px}
-.ti{max-width:14em}
-.si{max-width:60ch;font-size:.98rem}
-.ch{display:flex;gap:8px;align-items:center;background:var(--wine);border-bottom:2px solid var(--gold);padding:12px 12px 10px;margin:0 0 10px}
-.ci{flex:1;min-width:0;font:700 1.6rem var(--hf);background:transparent;border:0;border-bottom:1px dashed var(--gold);color:#f3e6dc;padding:0 0 2px}
-.mv{display:flex;gap:4px}
-.mv button,.x{width:32px;height:32px;border-radius:4px;border:1px solid var(--line);background:#1f1824;color:var(--ink);cursor:pointer;font:500 15px var(--bf);padding:0}
-.mv button:hover,.x:hover{border-color:var(--gold)}
-.it.ed{display:block;padding:6px 12px 6px 18px;border-top:0}
-.edrow{display:flex;align-items:center;gap:8px}
-.ie{display:block;width:100%;margin:4px 0 0;font:400 .9rem var(--bf);background:#1f1824;border:1px solid var(--line);color:var(--muted);padding:6px 8px;border-radius:3px;resize:vertical;min-height:34px}
-.ii,.li{flex:1;min-width:0;font:500 1rem var(--bf);background:#1f1824;border:1px solid var(--line);color:var(--ink);padding:8px;border-radius:3px}
-.one{display:flex;align-items:center;gap:6px;font-size:.85rem;color:var(--muted);margin:8px 0 0;cursor:pointer}
-.lrow{padding:0 18px 10px}
-.addrow{padding:6px 18px 0}
-.addcat{break-inside:avoid;margin:0 0 20px}
-
-@media(max-width:560px){.pair{flex-direction:column;gap:10px}.g{width:100%}.dots{width:100%;justify-content:space-between;gap:6px}.dots button{flex:1;max-width:60px;width:auto;height:44px;border-radius:12px;font-size:16px}.dots button.on{transform:scale(1.06)}.it.ed{padding:4px 12px 4px 18px}}
-@media(prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
-</style>
-<style>.__cwhr-sel{outline:1px solid hsl(40 70% 40%) !important;outline-offset:0;}html[data-cwhr-mode]:not(#__cwhr_),html[data-cwhr-mode] :not(#__cwhr_){cursor:url("data:image/svg+xml,%3Csvg%20xmlns%3D'http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg'%20width%3D'24'%20height%3D'24'%20viewBox%3D'0%200%2024%2024'%3E%3Cpath%20d%3D'M12%20.5h0A11.5%2011.5%200%200%201%2023.5%2012v0A11.5%2011.5%200%200%201%2012%2023.5H2.5a2%202%200%200%201-2-2V12A11.5%2011.5%200%200%201%2012%20.5Z'%20fill%3D'%23fff'%20stroke%3D'rgba(0%2C0%2C0%2C0.22)'%20stroke-width%3D'1'%2F%3E%3C%2Fsvg%3E") 1 23, url("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABgAAAAYCAYAAADgdz34AAACjklEQVR4AbRWS2gaURR9TGpiFTUEWpKQkA+EruqizWcRSBRT/G8KKpXiyo0ra1fVNiDFLmypFUo3iht/iO4Uay1FGwtFECl1p6KWLly4CGqrSMTY+wRFQ7WhGYd7Zu697845b+7M8B6BJh+UxcXFG3a7XeTxeHQAC+C12+1+ZLPZhHgMbp8FjLWxAkaj8U48Hg8lEomfIpEoLBaLLTKZTAd4LJFI3kD8HsZ+xGKxoMFgYI9T+JvAtUAg8FylUn3hcDj8ra0t6vLyMmKxWIhCofSAfZyDMRqXy+Wr1eqvPp/vKYjMAEZsRMDpdN6MRCKf+Xz+8cbGBm2kckIAtXShUGgKh8Mnfr9/Ybh0IKDT6a4vLS19EggE+wwGY7jmUj6TyUTQyv35+fmP0MbBexkISKVS+97e3u1LsU0oAo67Go3G1i/pCZjN5t3Nzc0H/zPzPlH/ip8EWvbQYrHs4hwWmN3e3n62traGfZy7MtbX12fYbPYTIKIQOzs7C6urq/cgINVWVlaO4EtjEXq9nken06mksgMZtJthtVp5xNzcHBsEIEWu0Wg0RKVS2USz2WTigFx6hPCkMTfRarXgB6WQzd/j63Q6bdK+nB7j0KnRaCCCIMpTE4D2oEql8m1qAvV6/VSr1U5PIJvN+qFjv6fyBIVC4ZfD4XgJAmekC9RqNZROp1+FQqESCCDSBWCVO1EoFC8wOQZpAnjm0Wj0O/xX94H4HNAzotvtNnreFU6lUgllMplAMpnclcvlp8NURC6Xi8BLGc5N9NvtNqpWq6hcLqN8Pn8OLUkAMe/g4EAOG4WzizcTJpPpA6zFIpfL9Ra2I45/IRgM2lKp1LtisXjs9XpvHR4eHimVythF4n78BwAA//8r8OPFAAAABklEQVQDAPCY8Oae0TJxAAAAAElFTkSuQmCC") 1 23, default !important;}html[data-cwhr-mode][data-cwhr-composing]:not(#__cwhr_),html[data-cwhr-mode][data-cwhr-composing] :not(#__cwhr_){cursor:default !important;}</style></head>
-<body id="artifacts-component-root-html">
-<header class="top">
-  <div class="head">
-    <div>
-      <input class="nm viewonly" id="nm" placeholder="Your name (optional)" maxlength="30" aria-label="Your name">
-      <h1 id="ttl"></h1>
-      <p class="sub" id="sub"></p>
-    </div>
-    <div class="acts">
-      
-      
-      
-    </div>
-  </div>
-  
-  <div class="tools viewonly">
-    <section class="tg"><h4>Compare with a partner</h4><div class="brow"><button class="btn p" id="gcd">Get my code</button><button class="btn" id="cmp">Compare</button></div></section>
-    <section class="tg"><h4>Your ratings</h4><div class="brow"><button class="btn p wide" id="sbm">Submit my ratings</button><button class="btn" id="dl">Download image</button><button class="btn" id="dlr">Download rated only</button><button class="btn wide" id="clr">Clear my ratings</button></div></section>
-  </div>
-  <div class="legend viewonly" id="legend"></div>
-  <div class="cmpnote viewonly" id="cnote" hidden=""><span>Someone shared their results with you. Rate the items you want, then compare.</span><button class="btn sm" id="cnow">Compare now</button></div>
-</header>
-<main class="cols" id="cols"></main>
-<p class="foot viewonly">Your ratings stay on your device. Nothing is uploaded. A code or link contains your answers, so only send it to someone you trust.</p>
-<div class="modal" id="mdl" hidden="" role="dialog" aria-modal="true"><div class="mbox"><button class="mx" id="mcl" aria-label="Close">✕</button><div id="mbody"></div></div></div>
-
-<script>
-/* ===== OWNER SETTINGS: managed by the editor. The locked copy you publish has LOCKED=true and no edit tools. ===== */
-const LOCKED=false;
-const BASE={
-  title:"My Kinklist",
-  subtitle:"Rate each one from 1 (hated) to 5 (very enjoyed). 3 means no opinion.",
-  labels:["Self","Partner"],
-  categories:[
-    {name:"Food",items:["Pizza","Sushi","Tacos","Pasta","Ice cream"]},
-    {name:"Games",items:["Minecraft","Roblox","Puzzle games","Racing games","Party games"]},
-    {name:"Hobbies",items:["Drawing","Reading","Baking","Swimming","Hiking"]},
-    {name:"Music",items:["Pop","Hip-hop","K-pop","Rock","Lo-fi"]},
-    {name:"School",items:["Math","Science","History","Art","PE"]},
-    {name:"Activities",items:["Movie night","Road trip","Board games","Beach day","Shopping"]}
-  ]
-};
-/* ===== end of owner settings ===== */
-
-const RATES=[["Hated","#c2415a","#fff"],["Dislike","#e0805f","#1a1210"],["Neutral","#8e8a9c","#fff"],["Like","#6fbf8b","#0f1a14"],["Very enjoyed","#35e08a","#0f1a14"]];
-const KEY="ratelist-locked-v2",DKEY="ratelist-draft-v1";
-const $=id=>document.getElementById(id);
-const esc=t=>String(t).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
-const key=(c,n,w)=>c+"|"+n+"|"+w;
-
-/* the config in use: owner draft while editing, otherwise the baked-in one */
-let CONFIG=BASE,EDIT=false;
-if(!LOCKED){try{const d=JSON.parse(localStorage.getItem(DKEY));if(d&&Array.isArray(d.categories))CONFIG=d}catch(e){}}
-CONFIG={...CONFIG,title:BASE.title};
-if(!Array.isArray(CONFIG.labels)||CONFIG.labels.length!==2)CONFIG={...CONFIG,labels:["Self","Partner"]};
-const saveDraft=()=>{if(LOCKED)return;try{localStorage.setItem(DKEY,JSON.stringify(CONFIG))}catch(e){}};
-
-/* visitor ratings */
-let S;try{S=JSON.parse(localStorage.getItem(KEY))||{}}catch(e){S={}}
-S.name=S.name||"";S.r=S.r||{};
-const save=()=>{try{localStorage.setItem(KEY,JSON.stringify(S))}catch(e){}};
-const get=(c,n,w)=>S.r[key(c,n,w)]||0;
-const OPEN=new Set();
-const lbl=c=>(c.labels&&c.labels.length===2)?c.labels:CONFIG.labels;
-const rows=c=>c.single?[lbl(c)[0]]:lbl(c);
-const infOf=(c,ii)=>((c.info&&c.info[ii])||"").trim();
-
-if(LOCKED)document.querySelectorAll(".own").forEach(e=>e.remove());
-
-function renderHead(){
-  document.title=CONFIG.title;
-  if(EDIT){
-    $("ttl").innerHTML=`<input class="ti" id="tin" value="${esc(CONFIG.title)}" maxlength="40" aria-label="Page title">`;
-    $("sub").innerHTML=`<input class="si" id="sin" value="${esc(CONFIG.subtitle)}" maxlength="160" aria-label="Subtitle">`;
-  }else{$("ttl").textContent=CONFIG.title;$("sub").textContent=CONFIG.subtitle}
+ ],
+ "labels": [
+  "Self",
+  "Partner"
+ ]
 }
-$("legend").innerHTML=RATES.map(([l,c,t],k)=>`<span><i style="background:${c};--t:${t}">${k+1}</i>${l}</span>`).join("");
-
-function renderView(){
-  $("cols").innerHTML=CONFIG.categories.map((c,ci)=>`<section class="card"><h2>${esc(c.name)}</h2>${c.items.map((n,ii)=>`<div class="it"><span class="n">${esc(n)}${infOf(c,ii)?`<button class="inf" data-c="${ci}" data-i="${ii}" aria-expanded="${OPEN.has(key(c.name,n,"i"))}" aria-label="What is ${esc(n)}?" title="What is this?">i</button>`:""}</span>${infOf(c,ii)?`<div class="info"${OPEN.has(key(c.name,n,"i"))?"":" hidden"}>${esc(infOf(c,ii))}</div>`:""}<div class="pair">${rows(c).map((lb,w)=>{const r=get(c.name,n,w);return `<div class="g"><span class="gl">${esc(lb)}</span><div class="dots">${RATES.map(([l,col,t],ri)=>`<button class="${r===ri+1?"on":""}" style="--c:${col};--t:${t}" data-c="${ci}" data-i="${ii}" data-w="${w}" data-r="${ri+1}" aria-label="${esc(n)}, ${esc(lb)}: ${ri+1} ${l}" aria-pressed="${r===ri+1}" title="${ri+1}: ${l}">${ri+1}</button>`).join("")}</div></div>`}).join("")}</div></div>`).join("")}</section>`).join("");
-}
-function renderEdit(){
-  $("cols").innerHTML=CONFIG.categories.map((c,ci)=>`<section class="card"><div class="ch"><input class="ci" data-k="cat" data-c="${ci}" value="${esc(c.name)}" maxlength="30" aria-label="Category name"><div class="mv"><button data-a="up" data-c="${ci}" title="Move up" aria-label="Move category up">↑</button><button data-a="dn" data-c="${ci}" title="Move down" aria-label="Move category down">↓</button><button data-a="rmc" data-c="${ci}" title="Delete category" aria-label="Delete category">✕</button></div></div><div class="lrow"><span class="gl">${c.single?"Name of the rating row":"Names of the two rating rows"}</span><div class="pair">${lbl(c).slice(0,c.single?1:2).map((l,w)=>`<input class="li" data-k="clbl" data-c="${ci}" data-w="${w}" value="${esc(l)}" maxlength="20" aria-label="Rating row name ${w+1}">`).join("")}</div><label class="one"><input type="checkbox" data-k="single" data-c="${ci}"${c.single?" checked":""}> Only one rating row</label></div>${c.items.map((n,ii)=>`<div class="it ed"><div class="edrow"><input class="ii" data-k="item" data-c="${ci}" data-i="${ii}" value="${esc(n)}" maxlength="40" aria-label="Item name"><button class="x" data-a="rmi" data-c="${ci}" data-i="${ii}" title="Delete item" aria-label="Delete item">✕</button></div><textarea class="ie" data-k="info" data-c="${ci}" data-i="${ii}" rows="2" maxlength="400" placeholder="Info box (optional): explain this for anyone who doesn't know what it means" aria-label="Info text">${esc((c.info&&c.info[ii])||"")}</textarea></div>`).join("")}<div class="addrow"><button class="btn sm" data-a="addi" data-c="${ci}">+ Add item</button></div></section>`).join("")+`<div class="addcat"><button class="btn" data-a="addc">+ Add category</button></div>`;
-}
-const render=()=>EDIT?renderEdit():renderView();
-
-$("cols").addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;
-  if(b.classList.contains("inf")){const c=CONFIG.categories[+b.dataset.c],k=key(c.name,c.items[+b.dataset.i],"i"),p=b.closest(".it").querySelector(".info"),show=p.hidden;p.hidden=!show;b.setAttribute("aria-expanded",show);show?OPEN.add(k):OPEN.delete(k);return}
-  if(EDIT){
-    const a=b.dataset.a,ci=+b.dataset.c,ii=+b.dataset.i,cs=CONFIG.categories;
-    if(a==="addc"){cs.push({name:"New category",items:[""],info:[""],labels:[...lbl(cs[0]||{})]});saveDraft();renderEdit();const f=$("cols").querySelectorAll(".ci");f[f.length-1].focus();f[f.length-1].select();return}
-    if(a==="addi"){cs[ci].items.push("");saveDraft();renderEdit();const f=$("cols").querySelectorAll(".card")[ci].querySelectorAll(".ii");f[f.length-1].focus();return}
-    if(a==="rmi"){cs[ci].items.splice(ii,1);if(cs[ci].info)cs[ci].info.splice(ii,1)}
-    else if(a==="rmc"){if(b.dataset.armed!=="1"){b.dataset.armed="1";b.textContent="Sure?";b.style.width="auto";b.style.padding="0 8px";setTimeout(()=>{b.dataset.armed="";b.textContent="✕";b.style.width="";b.style.padding=""},3000);return}cs.splice(ci,1)}
-    else if(a==="up"&&ci>0){[cs[ci-1],cs[ci]]=[cs[ci],cs[ci-1]]}
-    else if(a==="dn"&&ci<cs.length-1){[cs[ci+1],cs[ci]]=[cs[ci],cs[ci+1]]}
-    else return;
-    saveDraft();renderEdit();return;
-  }
-  const ci=+b.dataset.c,ii=+b.dataset.i,w=+b.dataset.w,v=+b.dataset.r,c=CONFIG.categories[ci],k=key(c.name,c.items[ii],w);
-  if(S.r[k]===v)delete S.r[k];else S.r[k]=v;
-  save();renderView();
-  if(S.r[k]){const on=document.querySelectorAll(".card")[ci].querySelectorAll(".it")[ii].querySelectorAll(".g")[w].querySelector(".on");on.classList.add("pop");on.focus({preventScroll:true})}
-});
-$("cols").addEventListener("input",e=>{if(!EDIT)return;const t=e.target,ci=+t.dataset.c;
-  if(t.dataset.k==="single"){CONFIG.categories[ci].single=t.checked;saveDraft();renderEdit();return}
-  if(t.dataset.k==="clbl"){const c=CONFIG.categories[ci];if(!c.labels||c.labels.length!==2)c.labels=[...CONFIG.labels];c.labels[+t.dataset.w]=t.value;saveDraft();return}
-  if(t.dataset.k==="cat")CONFIG.categories[ci].name=t.value;
-  else if(t.dataset.k==="item")CONFIG.categories[ci].items[+t.dataset.i]=t.value;
-  else if(t.dataset.k==="info"){const c=CONFIG.categories[ci];c.info=c.info||[];c.info[+t.dataset.i]=t.value}
-  else return;
-  saveDraft();
-});
-$("cols").addEventListener("keydown",e=>{
-  if(!EDIT||e.key!=="Enter"||e.target.dataset.k!=="item")return;
-  e.preventDefault();const ci=+e.target.dataset.c,ii=+e.target.dataset.i;
-  CONFIG.categories[ci].items.splice(ii+1,0,"");if(CONFIG.categories[ci].info)CONFIG.categories[ci].info.splice(ii+1,0,"");saveDraft();renderEdit();
-  $("cols").querySelectorAll(".card")[ci].querySelectorAll(".ii")[ii+1].focus();
-});
-$("ttl").addEventListener("input",e=>{if(EDIT&&e.target.id==="tin"){CONFIG.title=e.target.value;document.title=CONFIG.title;saveDraft()}});
-$("sub").addEventListener("input",e=>{if(EDIT&&e.target.id==="sin"){CONFIG.subtitle=e.target.value;saveDraft()}});
-
-$("nm").value=S.name;$("nm").oninput=e=>{S.name=e.target.value;save()};
-$("clr").onclick=()=>{if(confirm("Clear all your ratings?")){S.r={};save();render()}};
-
-/* remove blank items/categories, trim names */
-function tidy(){
-  CONFIG.title=CONFIG.title.trim()||"My Kinklist";
-  CONFIG.subtitle=CONFIG.subtitle.trim();
-  CONFIG.labels=CONFIG.labels.map((l,i)=>l.trim()||["Self","Partner"][i]);
-  CONFIG.categories=CONFIG.categories.map(c=>{const inf=c.info||[],pr=c.items.map((i,k)=>[i.trim(),(inf[k]||"").trim()]).filter(q=>q[0]);return{name:c.name.trim(),single:!!c.single,labels:[0,1].map(w=>((c.labels&&c.labels[w])||"").trim()||CONFIG.labels[w]),items:pr.map(q=>q[0]),info:pr.map(q=>q[1])}}).filter(c=>c.name&&c.items.length);
-  saveDraft();
-}
-function setEdit(on){
-  EDIT=on;document.body.classList.toggle("edit",on);
-  $("edt").textContent=on?"Done editing":"Edit categories";
-  $("rst").hidden=!on;$("enote").hidden=!on;
-  if(!on)tidy();
-  renderHead();render();
-}
-if(!LOCKED&&$("edt")){
-  $("edt").onclick=()=>setEdit(!EDIT);
-  let ra=0;$("rst").onclick=()=>{if(!ra){ra=1;$("rst").textContent="Click again to discard";setTimeout(()=>{ra=0;$("rst").textContent="Discard my edits"},3000);return}ra=0;$("rst").textContent="Discard my edits";try{localStorage.removeItem(DKEY)}catch(e){}CONFIG=JSON.parse(JSON.stringify(BASE));renderHead();render()};
-  $("lck").onclick=()=>{
-    tidy();
-    const stop=(t,m)=>openM(`<h3>${t}</h3><p class="mp">${esc(m)}</p>`);
-    if(!CONFIG.categories.length)return stop("Can't lock yet","Add at least one category with one item first.");
-    for(const c of CONFIG.categories){const seen=new Set();for(const i of c.items){if(seen.has(i))return stop("Can't lock yet",'"'+c.name+'" has "'+i+'" twice. Rename or delete one first.');seen.add(i)}}
-    if(EDIT)setEdit(false);else{renderHead();render()}
-    const clone=document.documentElement.cloneNode(true);
-    clone.querySelector("body").classList.remove("edit");
-    ["cols","legend","ttl","sub","mbody"].forEach(id=>clone.querySelector("#"+id).innerHTML="");
-    ["mdl","cnote"].forEach(id=>clone.querySelector("#"+id).setAttribute("hidden",""));
-    clone.querySelectorAll(".own").forEach(e=>e.remove());
-    clone.querySelector("#nm").removeAttribute("value");
-    clone.querySelector("title").textContent=CONFIG.title;
-    const sc=clone.querySelector("script");
-    const json=JSON.stringify(CONFIG,null,2).replace(/</g,"\\u003c");
-    sc.textContent=sc.textContent.replace(/(\/\* ===== OWNER SETTINGS[\s\S]*?=====\s*\*\/)[\s\S]*?(\/\* ===== end of owner settings)/,(m,a,b)=>a+"\nconst LOCKED=true;\nconst BASE="+json+";\n"+b);
-    FIN="<!doctype html>\n"+clone.outerHTML;
-    openM(`<h3>Your finished page</h3><p class="mp">Press "Copy page code", then on GitHub open index.html, click the pencil (Edit), select everything, paste, and commit. If copying fails, click inside the box, press Ctrl+A then Ctrl+C.</p><textarea class="ta" id="fin" readonly spellcheck="false" style="min-height:150px"></textarea><div class="brow"><button class="btn p" data-fin="copy">Copy page code</button></div>`,"fin");
-    $("fin").value=FIN;
-  };
-}
-
-let FIN="";
-function rr(x,a,b,w,h,r){x.beginPath();x.moveTo(a+r,b);x.arcTo(a+w,b,a+w,b+h,r);x.arcTo(a+w,b+h,a,b+h,r);x.arcTo(a,b+h,a,b,r);x.arcTo(a,b,a+w,b,r);x.closePath()}
-function fit(x,t,max){if(x.measureText(t).width<=max)return t;while(t.length>1&&x.measureText(t+"…").width>max)t=t.slice(0,-1);return t+"…"}
-async function exportPNG(only){
-  try{await document.fonts.ready}catch(e){}
-  const HF='"Cormorant Garamond",Georgia,serif',BF='"Jost",system-ui,sans-serif',IVORY="#f3e6dc",CARD="#171219",GOLD="#b08d57";
-  const cols=3,W=1500,pad=44,gap=22,cw=(W-pad*2-gap*(cols-1))/cols,RH=96,TH=76;
-  const cards=CONFIG.categories.map(c=>({c,items:c.items.filter(n=>!only||get(c.name,n,0)||(!c.single&&get(c.name,n,1)))})).filter(o=>o.items.length);
-  const colH=Array(cols).fill(0),place=[];
-  cards.forEach(o=>{const h=TH+o.items.length*RH+16;let k=colH.indexOf(Math.min(...colH));place.push({o,k,y:colH[k],h});colH[k]+=h+gap});
-  const top=200,H=top+Math.max(...colH,0)+pad-gap+10,sc=2;
-  const cv=document.createElement("canvas");cv.width=W*sc;cv.height=H*sc;const x=cv.getContext("2d");x.scale(sc,sc);
-  const g=x.createRadialGradient(W/2,-60,0,W/2,-60,900);g.addColorStop(0,"#2b0f1e");g.addColorStop(1,"#0d0a0f");
-  x.fillStyle="#0d0a0f";x.fillRect(0,0,W,H);x.fillStyle=g;x.fillRect(0,0,W,H);
-  x.textBaseline="alphabetic";x.textAlign="left";
-  const nm=S.name.trim();
-  if(nm){x.fillStyle=GOLD;x.font=`italic 600 32px ${HF}`;x.fillText(nm,pad,66)}
-  x.fillStyle=IVORY;x.font=`italic 600 78px ${HF}`;x.fillText(fit(x,CONFIG.title,W-pad*2),pad,nm?140:116);
-  let lx=pad;
-  RATES.forEach(([l,c,t],k)=>{x.beginPath();x.arc(lx+11,top-34,11,0,7);x.fillStyle=c;x.fill();x.fillStyle=t;x.font=`600 14px ${BF}`;x.textAlign="center";x.fillText(k+1,lx+11,top-29);x.textAlign="left";x.font=`500 20px ${BF}`;x.fillStyle="#eadfe0";x.fillText(l,lx+30,top-27);lx+=30+x.measureText(l).width+28});
-  place.forEach(({o,k,y,h})=>{
-    const cx=pad+k*(cw+gap),cy=top+y;
-    x.save();rr(x,cx,cy,cw,h,4);x.clip();x.fillStyle=CARD;x.fillRect(cx,cy,cw,h);x.fillStyle="#2a0f1c";x.fillRect(cx,cy,cw,62);x.fillStyle=GOLD;x.fillRect(cx,cy+60,cw,2);x.restore();
-    x.strokeStyle="#2c2231";x.lineWidth=1;rr(x,cx+.5,cy+.5,cw-1,h-1,4);x.stroke();
-    x.fillStyle=IVORY;x.font=`700 42px ${HF}`;x.fillText(fit(x,o.c.name,cw-40),cx+20,cy+44);
-    o.items.forEach((n,r)=>{
-      const iy=cy+TH+r*RH,gw=5*34,gx=[cx+20,cx+20+gw+22];
-      if(r>0){x.fillStyle="#2c2231";x.fillRect(cx+16,iy-4,cw-32,1)}
-      x.fillStyle="#eadfe0";x.font=`600 22px ${BF}`;x.textAlign="left";x.fillText(fit(x,n,cw-40),cx+20,iy+22);
-      rows(o.c).forEach((_,w)=>{
-        const v=get(o.c.name,n,w);
-        x.fillStyle="#9a8f9c";x.font=`500 16px ${BF}`;x.textAlign="left";x.fillText(fit(x,lbl(o.c)[w],gw),gx[w],iy+44);
-        RATES.forEach(([l,c,t],ri)=>{const dx=gx[w]+ri*34+15,dy=iy+66,on=v===ri+1;
-          if(on){x.beginPath();x.arc(dx,dy,19,0,7);x.globalAlpha=.3;x.fillStyle=c;x.fill();x.globalAlpha=1}
-          x.beginPath();x.arc(dx,dy,on?15:13,0,7);
-          if(on){x.fillStyle=c;x.fill();x.strokeStyle="#fff";x.lineWidth=2.5;x.stroke()}
-          else{x.fillStyle=CARD;x.fill();x.globalAlpha=.16;x.fillStyle=c;x.fill();x.globalAlpha=.8;x.strokeStyle=c;x.lineWidth=2;x.stroke();x.globalAlpha=1}
-          x.fillStyle=on?t:c;x.font=`600 ${on?17:14}px ${BF}`;x.textAlign="center";x.fillText(ri+1,dx,dy+(on?6:5));x.textAlign="left"});
-      });
-    });
-  });
-  cv.toBlob(b=>{const a=document.createElement("a");a.href=URL.createObjectURL(b);a.download="my-kinklist.png";a.click();setTimeout(()=>URL.revokeObjectURL(a.href),2000)},"image/png");
-}
-/* ===== codes: pure functions ===== */
-const A32="0123456789ABCDEFGHJKMNPQRSTVWXYZ";
-const layout=()=>{const L=[];CONFIG.categories.forEach((c,ci)=>c.items.forEach((n,ii)=>rows(c).forEach((_,w)=>L.push([ci,ii,w]))));return L};
-const fp=()=>{let h=2166136261;const t=JSON.stringify(CONFIG.categories.map(c=>[c.name,!!c.single,c.items]));for(let i=0;i<t.length;i++){h^=t.charCodeAt(i);h=Math.imul(h,16777619)>>>0}return[0,1,2,3].map(k=>A32[(h>>>(k*5))&31]).join("")};
-const bodyLen=N=>N?Math.ceil((6n**BigInt(N)-1n).toString(2).length/5):1;
-const encName=nm=>{const b=new TextEncoder().encode(Array.from(String(nm||"").trim()).slice(0,24).join(""));let bits=0,acc=0,out="";for(const x of b){acc=(acc<<8)|x;bits+=8;while(bits>=5){out+=A32[(acc>>>(bits-5))&31];bits-=5}acc&=(1<<bits)-1}if(bits)out+=A32[(acc<<(5-bits))&31];return out};
-const decName=t=>{let bits=0,acc=0;const b=[];for(const ch of t){acc=(acc<<5)|A32.indexOf(ch);bits+=5;if(bits>=8){b.push((acc>>>(bits-8))&255);bits-=8;acc&=(1<<bits)-1}}try{return new TextDecoder().decode(new Uint8Array(b)).replace(/[\u0000-\u001f]/g,"").slice(0,24)}catch(e){return""}};
-const fmt=t=>t.match(/.{1,5}/g).join("-");
-function myCode(){
-  const L=layout();let n=0n;
-  for(let k=L.length-1;k>=0;k--){const[ci,ii,w]=L[k],c=CONFIG.categories[ci];n=n*6n+BigInt(get(c.name,c.items[ii],w))}
-  let out="";for(let i=0;i<bodyLen(L.length);i++){out=A32[Number(n&31n)]+out;n>>=5n}
-  return fp()+out+encName(S.name);
-}
-function decode(raw){
-  let t=String(raw).trim();const m=t.match(/r=([^&\s]+)/i);if(m)t=m[1];
-  t=t.toUpperCase().replace(/O/g,"0").replace(/[IL]/g,"1").replace(/[^0-9A-Z]/g,"");
-  const L=layout(),bad={err:"That code doesn't look right. Check that you copied all of it."};
-  if(t.length<5||[...t].some(ch=>!A32.includes(ch)))return bad;
-  if(t.slice(0,4)!==fp())return{err:"This code is from a different checklist, or the checklist was changed after it was made. Ask them to send a fresh code."};
-  const bl=4+bodyLen(L.length);if(t.length<bl)return bad;
-  let n=0n;for(const ch of t.slice(4,bl))n=n*32n+BigInt(A32.indexOf(ch));
-  if(n>=6n**BigInt(L.length))return bad;
-  const v=[];for(let k=0;k<L.length;k++){v.push(Number(n%6n));n/=6n}
-  return{L,v,name:decName(t.slice(bl))};
-}
-/* ===== end codes ===== */
-
-/* ===== compare + dialogs ===== */
-function compareHTML(d){
-  if(d.err)return `<p class="err">${esc(d.err)}</p>`;
-  if(!layout().some(([ci,ii,w])=>w===0&&get(CONFIG.categories[ci].name,CONFIG.categories[ci].items[ii],0)))return `<p class="err">Rate some items first so there is something to compare.</p>`;
-  const same=d.L.every(([ci,ii,w],k)=>get(CONFIG.categories[ci].name,CONFIG.categories[ci].items[ii],w)===d.v[k]);
-  const cats=CONFIG.categories.map(c=>({c,pts:[]})),yes=[],talk=[];
-  d.L.forEach(([ci,ii,w],k)=>{
-    if(w!==0)return;
-    const c=CONFIG.categories[ci],n=c.items[ii],a=get(c.name,n,0),b=d.v[k];
-    if(!a||!b)return;
-    const diff=Math.abs(a-b);cats[ci].pts.push((4-diff)/4);
-    if(a>=4&&b>=4)yes.push(n);
-    if(diff>=2)talk.push([n,a,b,diff]);
-  });
-  const all=cats.flatMap(o=>o.pts);
-  if(!all.length)return `<p class="err">You haven't both rated any of the same items yet.</p>`;
-  const avg=a=>a.reduce((x,y)=>x+y,0)/a.length,pct=Math.round(avg(all)*100);
-  const word=pct>=85?"Very in sync":pct>=70?"Great match":pct>=50?"Some common ground":"Lots to talk about";
-  talk.sort((x,y)=>y[3]-x[3]);
-  const ln=(S.name||"").trim()||"You",tn=d.name||"Them";
-  return (same?`<p class="err">Heads up: these answers are identical to yours. If you pasted your own code, send it to your partner and paste theirs instead.</p>`:"")+`<p class="verdict" style="margin:14px 0 0">${esc(ln)} &amp; ${esc(tn)}</p><div class="big" style="margin-top:4px">${pct}%</div><p class="verdict">${word}</p><p class="mp">Based on ${all.length} item${all.length===1?"":"s"} you both rated.</p>`
-   +cats.filter(o=>o.pts.length).map(o=>{const q=Math.round(avg(o.pts)*100);return `<div class="pc"><div><span>${esc(o.c.name)}</span><span>${q}%</span></div><div class="bar"><i style="width:${q}%"></i></div></div>`}).join("")
-   +`<div class="mh">Yes list</div>`+(yes.length?`<div class="chips">${yes.map(n=>`<span class="chip g">${esc(n)}</span>`).join("")}</div>`:`<p class="mp">Nothing you both rated 4 or 5 yet.</p>`)
-   +`<div class="mh">Let's talk</div>`+(talk.length?`<div class="chips">${talk.map(([n,a,b])=>`<span class="chip t">${esc(n)}<small>${esc(ln)} ${a} · ${esc(tn)} ${b}</small></span>`).join("")}</div>`:`<p class="mp">No big differences. Nice!</p>`);
-}
-const mdl=$("mdl"),mb=$("mbody");
-let CUR={code:"",link:""},PENDING="";
-function openM(html,focusId){mb.innerHTML=html;mdl.hidden=false;const f=focusId&&$(focusId);(f||$("mcl")).focus()}
-function closeM(){mdl.hidden=true;mb.innerHTML=""}
-function openCode(submitted){
-  const L=layout(),done=L.filter(([ci,ii,w])=>get(CONFIG.categories[ci].name,CONFIG.categories[ci].items[ii],w)).length,raw=myCode();
-  CUR={code:fmt(raw),link:location.href.split("#")[0]+"#r="+raw};
-  const intro=!done?"You haven't rated anything yet, so there is nothing to save or share. Rate some items first.":submitted?`Your ratings are saved on this device (${done} of ${L.length} answers). You can come back and change them any time. Send the code or link below to your partner so they can compare.`:"Send this code or link to your partner. They open it, rate their own checklist, and press Compare.";
-  const tip=done&&!S.name.trim()?" Tip: type your name at the top first, so your partner sees it in the results.":"";
-  openM(`<h3>${submitted&&done?"Submitted ✓":"Your code"}</h3><p class="mp">${esc(intro+tip)}</p><code class="cd">${esc(CUR.code)}</code><div class="brow"><button class="btn p" data-copy="code">Copy code</button><button class="btn" data-copy="link">Copy link</button></div><p class="mp" style="margin:14px 0 0">This code contains your answers. Only send it to someone you trust. Nothing is uploaded, and this site never sees it.</p>`);
-}
-function runCompare(){$("cres").innerHTML=compareHTML(decode($("cin").value))}
-function openCompare(pre){
-  openM(`<h3>Compare</h3><p class="mp">Paste your partner's code or link below. Your own current ratings are compared with theirs.</p><textarea class="ta" id="cin" placeholder="Paste their code or link here" spellcheck="false"></textarea><div class="brow"><button class="btn p" data-go="1">Compare</button></div><div id="cres"></div>`,"cin");
-  if(pre){$("cin").value=pre;runCompare()}
-}
-function copyText(t,b){
-  const done=()=>{const o=b.textContent;b.textContent="Copied!";setTimeout(()=>b.textContent=o,1500)};
-  const fb=()=>{const a=document.createElement("textarea");a.value=t;a.style.position="fixed";a.style.opacity="0";document.body.appendChild(a);a.select();try{document.execCommand("copy");done()}catch(e){}a.remove()};
-  if(navigator.clipboard&&navigator.clipboard.writeText)navigator.clipboard.writeText(t).then(done,fb);else fb();
-}
-mb.addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;
-  if(b.dataset.copy)copyText(b.dataset.copy==="code"?CUR.code:CUR.link,b);
-  if(b.dataset.go)runCompare();
-  if(b.dataset.fin==="copy"){const t=$("fin");t.focus();t.select();copyText(FIN,b)}
-});
-$("mcl").onclick=closeM;
-mdl.addEventListener("click",e=>{if(e.target===mdl)closeM()});
-document.addEventListener("keydown",e=>{if(e.key==="Escape"&&!mdl.hidden)closeM()});
-$("gcd").onclick=()=>openCode(false);
-$("sbm").onclick=()=>openCode(true);
-$("cmp").onclick=()=>openCompare(PENDING);
-$("cnow").onclick=()=>openCompare(PENDING);
-{const hm=location.hash.match(/r=([0-9A-Za-z-]+)/);if(hm){PENDING=hm[1];$("cnote").hidden=false;const pd=decode(PENDING);if(!pd.err&&pd.name)$("cnote").querySelector("span").textContent=pd.name+" shared their results with you. Rate the items you want, then compare."}}
-/* ===== end compare ===== */
-
-$("dl").onclick=()=>exportPNG(false);
-$("dlr").onclick=()=>exportPNG(true);
-renderHead();render();
-</script>
-
-
-</body></html>
